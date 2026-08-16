@@ -173,11 +173,11 @@ This is an early open-source release; the following are open:
    Control-flow flattening is gated off (`-flatten`) — its local-label
    dispatchers do not survive multi-function assembly.
 4. **Agent receive boundary at ~3KB command frames**: single commands with
-   payloads up to ~2 KB hex complete reliably (verified 2/20/100/500/1000/
-   2000); 3 KB+ frames intermittently fail with sandbox pipe errors. The
-   mid-frame polling fix extended the reliable range; the remaining boundary
-   is under investigation. UploadFile is therefore configured with 900-byte
-   chunks and marked experimental.
+   payloads up to ~2 KB hex complete reliably; 4 KB+ frames fail at the
+   agent-to-sandbox pipe stage (sandbox handles the same sizes directly).
+   Debugging state, ruled-out hypotheses, and the fix path are recorded in
+   . UploadFile is configured with
+   900-byte chunks and marked experimental until this is resolved.
 5. Sandbox `execute` terminates children after 30 s and caps captured output
    at 64 KB; the sandbox heap is reclaimed between commands (a bump-allocator
    that never freed exhausted 4 MB after repeated process_list calls);
