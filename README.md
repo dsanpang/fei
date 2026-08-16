@@ -172,10 +172,24 @@ This is an early open-source release; the following are open:
    missing from the original spec: template library and containerized nasm.
    Control-flow flattening is gated off (`-flatten`) — its local-label
    dispatchers do not survive multi-function assembly.
-4. Console: no topology graph, multi-user collaboration or plugin packaging
-   yet; file upload is single-shot (≤ ~7 KB) and download returns hex.
+4. **Agent receive boundary at ~3KB command frames**: single commands with
+   payloads up to ~2 KB hex complete reliably (verified 2/20/100/500/1000/
+   2000); 3 KB+ frames intermittently fail with sandbox pipe errors. The
+   mid-frame polling fix extended the reliable range; the remaining boundary
+   is under investigation. UploadFile is therefore configured with 900-byte
+   chunks and marked experimental.
 5. Sandbox `execute` terminates children after 30 s and caps captured output
-   at 64 KB (was: unbounded wait, 8 KB).
+   at 64 KB; the sandbox heap is reclaimed between commands (a bump-allocator
+   that never freed exhausted 4 MB after repeated process_list calls);
+   `file_append` (0x07) enables chunked writes.
+6. **TLS-mode implant is functional via the connection supervisor**: the
+   Schannel receive stream-state still degrades after a few frames, but the
+   supervisor tears down and reconnects (~9 s cycle), and commands complete
+   over TLS (sysinfo/shell verified). PLAIN_TCP + inner AEAD remains the
+   default; sustained TLS operation produces periodic re-registrations in
+   gateway logs (operationally visible).
+7. Console: no topology graph, multi-user collaboration or plugin packaging
+   yet; file upload/download UI still unusable.
 
 Verified end-to-end (PLAIN_TCP mode, this repository's test tooling):
 crypto interop suite (6/6), sandbox direct suite (7/7), gateway unit/e2e

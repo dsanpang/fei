@@ -19,6 +19,7 @@ pub const CMD_DIR_LIST: u8 = 0x03;
 pub const CMD_FILE_READ: u8 = 0x04;
 pub const CMD_FILE_WRITE: u8 = 0x05;
 pub const CMD_EXECUTE: u8 = 0x06;
+pub const CMD_FILE_APPEND: u8 = 0x07;
 pub const CMD_DBG_QUERY: u8 = 0x09;
 
 #[repr(C)]
@@ -96,6 +97,7 @@ const FILE_OPEN: u32 = 0x01;
 const FILE_OVERWRITE_IF: u32 = 0x05;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_APPEND_DATA: u32 = 0x0004;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
@@ -239,9 +241,11 @@ unsafe fn nt_create_file(
     iosb: *mut IoStatusBlock, alloc: usize, file_attrs: u32, share: u32,
     disposition: u32, options: u32,
 ) -> i32 {
-    nt_call!(b"NtCreateFile", SigNtCreateFile,
+    let r = nt_call!(b"NtCreateFile", SigNtCreateFile,
              handle, access, attrs, iosb, alloc, file_attrs, share,
-             disposition, options, 0, 0)
+             disposition, options, 0, 0);
+    LAST_NT_STATUS.store(r, core::sync::atomic::Ordering::Relaxed);
+    r
 }
 
 unsafe fn get_peb() -> usize {
@@ -344,12 +348,28 @@ pub unsafe fn debug_write(handle: usize, data: &[u8]) {
     let _ = write_all(handle, data);
 }
 
+static mut RESET_HOOK: Option<fn()> = None;
+
+pub fn run_with_reset(reset: fn()) {
+    unsafe { RESET_HOOK = Some(reset) }
+    run()
+}
+
 pub fn run() {
     unsafe {
         let (stdin, stdout) = get_std_handles();
         let mut cmd_buf = [0u8; CMD_BUF_SIZE];
 
         loop {
+            // reclaim the bump heap between commands: every allocation from
+            // the previous iteration (response Vecs, staging) was already
+            // written to the pipe, so resetting the pointer is safe and
+            // prevents long-session exhaustion (process_list alone reserves
+            // up to 1 MB per call against the 4 MB heap)
+            unsafe {
+                if let Some(h) = RESET_HOOK { h() }
+            }
+
             let (cmd_type, payload_len) = match read_command(stdin, &mut cmd_buf) {
                 Some(v) => v,
                 None => return,
@@ -369,6 +389,7 @@ pub fn run() {
                 CMD_FILE_READ => handle_file_read(&mut resp, payload),
                 CMD_FILE_WRITE => handle_file_write(&mut resp, payload),
                 CMD_EXECUTE => handle_execute(&mut resp, payload),
+                CMD_FILE_APPEND => handle_file_append(&mut resp, payload),
                 CMD_DBG_QUERY => handle_dbg_query(&mut resp, payload),
                 _ => resp.extend_from_slice(b"{\"error\":\"unknown command\"}"),
             }
@@ -1138,6 +1159,70 @@ fn push_nt_error(out: &mut Vec<u8>, msg: &[u8]) {
 
 pub static LAST_NT_STATUS: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 pub static LAST_QIOSB_INFO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+unsafe fn handle_file_append(out: &mut Vec<u8>, payload: &[u8]) {
+    // payload: <path>   <hex content> — opens existing file and appends
+    let split = match payload.iter().position(|&b| b == 0) {
+        Some(i) => i,
+        None => {
+            out.extend_from_slice(b"{\"error\":\"payload must be path<NUL>hex\"}");
+            return;
+        }
+    };
+    let (path, hex_part) = payload.split_at(split);
+    let hex_part = &hex_part[1..];
+    if hex_part.len() % 2 != 0 {
+        out.extend_from_slice(b"{\"error\":\"odd hex length\"}");
+        return;
+    }
+    let mut content: Vec<u8> = Vec::new();
+    for i in (0..hex_part.len()).step_by(2) {
+        match (hex_val(hex_part[i]), hex_val(hex_part[i + 1])) {
+            (Some(h), Some(l)) => content.push((h << 4) | l),
+            _ => {
+                out.extend_from_slice(b"{\"error\":\"invalid hex\"}");
+                return;
+            }
+        }
+    }
+
+    let wide_path = wide_nt_path(path);
+    let unicode_name = UnicodeString {
+        length: (wide_path.len() * 2) as u16,
+        maximum_length: (wide_path.len() * 2 + 2) as u16,
+        buffer: wide_path.as_ptr() as *mut u16,
+    };
+    let obj_attrs = ObjectAttributes {
+        length: 48,
+        root_directory: 0,
+        object_name: &unicode_name,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: 0,
+        security_quality_of_service: 0,
+    };
+
+    let mut handle: usize = 0;
+    let mut iosb = IoStatusBlock { status: 0, information: 0 };
+    let status = nt_open_file(
+        &mut handle,
+        (FILE_APPEND_DATA | SYNCHRONIZE) as u32,
+        &obj_attrs,
+        &mut iosb,
+        FILE_SHARE_READ,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    );
+    if status < 0 {
+        out.push(b'{');
+        push_nt_error(out, b"failed to open file for append");
+        out.push(b'}');
+        return;
+    }
+    let _ = write_all(handle, &content);
+    nt_close(handle);
+    out.extend_from_slice(b"{\"appended\":");
+    push_dec(out, content.len() as u64);
+    out.extend_from_slice(b"}");
+}
 
 fn push_dec(out: &mut Vec<u8>, mut n: u64) {
     if n == 0 {

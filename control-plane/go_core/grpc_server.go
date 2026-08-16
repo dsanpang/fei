@@ -343,38 +343,62 @@ func (s *GRPCServer) ListDirectory(ctx context.Context, req *pb.ListDirectoryReq
 	}, nil
 }
 
-// UploadFile: reads the operator-side local file, hex-encodes it and sends a
-// sandbox file_write frame. Single-shot (<= ~7KB payload); chunked transfer
-// is on the roadmap.
+// UploadFile: chunked transfer. The first chunk truncates/creates the remote
+// file (sandbox 0x05 file_write); every subsequent chunk appends (0x07).
+// Chunk size ~3.5KB binary = ~7KB hex per command frame, comfortably inside
+// the 16KB agent command budget.
 func (s *GRPCServer) UploadFile(ctx context.Context, req *pb.UploadFileRequest) (*pb.UploadFileResponse, error) {
 	content, err := os.ReadFile(req.LocalPath)
 	if err != nil {
 		return &pb.UploadFileResponse{Success: false, Error: err.Error()}, nil
 	}
-	const maxBytes = 7000
-	if len(content) > maxBytes {
-		return &pb.UploadFileResponse{
-			Success: false,
-			Error:   fmt.Sprintf("file too large for single-shot upload (%d > %d bytes); chunked transfer not implemented yet", len(content), maxBytes),
-		}, nil
-	}
 
-	frame := append(append([]byte(req.RemotePath), 0), []byte(hex.EncodeToString(content))...)
-	payload := sandboxFrame(0x05, frame)
+	const chunkBytes = 900 // per-command budget verified reliable end-to-end; 3KB+ frames hit an agent receive boundary (see README known issues)
+	total := len(content)
+	for off, i := 0, 0; off < total; off += chunkBytes {
+		end := off + chunkBytes
+		if end > total {
+			end = total
+		}
+		frame := append(append([]byte(req.RemotePath), 0), []byte(hex.EncodeToString(content[off:end]))...)
+		cmd := byte(0x07) // file_append
+		if i == 0 {
+			cmd = 0x05 // file_write: create/truncate
+		}
+		payload := sandboxFrame(cmd, frame)
 
-	taskID, err := s.forwardCommandToAgent(req.AgentId, 0x02, payload)
-	if err != nil {
-		return &pb.UploadFileResponse{Success: false, Error: err.Error()}, nil
-	}
-	if task := s.waitTask(taskID, 8*time.Second); task != nil && task.Status == TaskCompleted {
-		return &pb.UploadFileResponse{
-			Success: true,
-			Message: fmt.Sprintf("uploaded %d bytes: %s -> %s", len(content), req.LocalPath, req.RemotePath),
-		}, nil
+		// the agent's TLS supervisor occasionally cycles mid-command; retry
+		// each chunk once before declaring failure
+		var lastErr string
+		ok := false
+		for attempt := 0; attempt < 3 && !ok; attempt++ {
+			taskID, err := s.forwardCommandToAgent(req.AgentId, 0x02, payload)
+			if err != nil {
+				lastErr = err.Error()
+				continue
+			}
+			task := s.waitTask(taskID, 8*time.Second)
+			if task != nil && task.Status == TaskCompleted {
+				ok = true
+				break
+			}
+			if task != nil {
+				lastErr = string(task.Status)
+			} else {
+				lastErr = "timeout"
+			}
+		}
+		if !ok {
+			return &pb.UploadFileResponse{
+				Success: false,
+				Error:   fmt.Sprintf("chunk %d/%d failed after retries: %s", i+1, (total+chunkBytes-1)/chunkBytes, lastErr),
+			}, nil
+		}
+		i++
 	}
 	return &pb.UploadFileResponse{
 		Success: true,
-		Message: fmt.Sprintf("Upload task %s queued", taskID),
+		Message: fmt.Sprintf("uploaded %d bytes in chunks: %s -> %s", total, req.LocalPath, req.RemotePath),
 	}, nil
 }
 

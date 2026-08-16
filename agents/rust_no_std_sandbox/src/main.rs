@@ -25,6 +25,15 @@ impl BumpAllocator {
         }
     }
 
+    fn reset(&self) {
+        // only safe when no allocations from previous iterations are live
+        // (caller guarantees responses were fully flushed to the pipe)
+        unsafe {
+            let self_mut = self as *const Self as *mut Self;
+            (*self_mut).next.store((*self_mut).heap_start, Ordering::SeqCst);
+        }
+    }
+
     fn init(&self, heap_start: usize, heap_size: usize) {
         self.next.store(heap_start, Ordering::SeqCst);
         unsafe {
@@ -97,7 +106,7 @@ pub extern "C" fn _start() -> ! {
         ALLOCATOR.init(HEAP.as_ptr() as usize, HEAP_SIZE);
     }
 
-    fei_agent_sandbox::run();
+    fei_agent_sandbox::run_with_reset(|| unsafe { ALLOCATOR.reset(); });
 
     fei_agent_sandbox::exit_process(0)
 }
