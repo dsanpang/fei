@@ -164,14 +164,18 @@ This is an early open-source release; the following are open:
 2. Single PSK for all agents (no per-agent key derivation or rotation).
    Anti-replay IS wired in: the gateway enforces strictly increasing per-
    session sequence numbers and drops replays (logged).
-3. Compiler worker emits raw position-independent shellcode, not a linked PE;
-   template library and containerized nasm from the original spec are not
-   implemented.
+3. Compiler worker: `-emit-pe` (default) produces a standalone PE64 via a
+   hand-rolled COFF→PE linker with kernel32 import thunks, relocations and
+   .reloc; XOR constant splitting and label renaming are self-checked, and
+   variable-length labels + random NOP insertion give every build a distinct
+   hash (verified: obfuscated PE passes the live command battery). Still
+   missing from the original spec: template library and containerized nasm.
+   Control-flow flattening is gated off (`-flatten`) — its local-label
+   dispatchers do not survive multi-function assembly.
 4. Console: no topology graph, multi-user collaboration or plugin packaging
    yet; file upload is single-shot (≤ ~7 KB) and download returns hex.
-5. The sandbox's `execute` output is capped at ~8 KB with no timeout kill;
-   sandbox panic → process terminate (never spins) is verified by
-   `tools/sandboxtest`.
+5. Sandbox `execute` terminates children after 30 s and caps captured output
+   at 64 KB (was: unbounded wait, 8 KB).
 
 Verified end-to-end (PLAIN_TCP mode, this repository's test tooling):
 crypto interop suite (6/6), sandbox direct suite (7/7), gateway unit/e2e
