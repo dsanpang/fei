@@ -1,135 +1,206 @@
-为了确保整个开发团队在面对复杂的分布式测控与远程管理平台（“蜚 / Fei” 平台）时，能够严格按照【纯 ASM / Rust no_std】(端点) + 【Go / NATS】(网关) + 【Rust / Tauri】(控制端) 的黄金技术堆栈平稳推进，防止工程实现由于层级过多而跑偏，以下为你整理出最终优化版的**全栈工程落地开发白皮书**。
+# "蜚" (Fei) 红队 C2 框架 — 工程规范白皮书
 
-这份文档将所有模块的职责边界、网络协议的动态对齐、以及各组件之间的依赖关系彻底规范化。你可直接将其存入团队的 Wiki 或 Git 仓库（如 `DEVELOPMENT_SPEC.md`）作为最高技术准则。
-
----
-
-# “蜚” (Fei) 分布式测控平台全栈工程落地开发白皮书
-
-**Version:** 3.0.0 (2026-05)
+**Version:** 3.1.0 (2026-08,修订版)
 
 **Classification:** Internal Technical Standard
 
-**Design Core:** 控制面微服务化（Tauri + Go），数据面极端拟态与物理隔离（Go Gateway + NATS），端点无高级语言特征常驻与影子沙箱执行（ASM + Rust no_std）。
+> 本文档是项目最初的开发白皮书的**修订版**,与仓库实际实现逐项对齐。
+> 原版(2026-05)中已过时或从未落地的设计在本版中直接修正;未实现的部分
+> 明确标注为路线图。**任何模块设计与本文冲突时,以代码和 README 的
+> Known issues 为准,并回改本文。**
+
+**Design Core:** 控制面微服务化(Tauri + Go),数据面物理隔离(Go Gateway
++ NATS),端点极小化常驻(x64 ASM 内核)与子进程沙箱执行(Rust no_std)。
+
+**使用约束:** 本框架仅限书面授权下的红队作业、对抗演练与防御研究,见
+`DISCLAIMER.md`。
 
 ---
 
-## 🛠️ 一、 全栈技术栈职责边界 (System Layers & Responsibilities)
-
-整个系统划分为四个独立的生命周期层，各层之间通过强类型、强规约的接口进行松耦合通信。
+## 一、 系统分层与职责(与代码对齐)
 
 ```
 +-------------------------------------------------------------+
-| 1. 操作控制端 (Tauri + Vue3)                                 |
-|    - 职责：多用户协同、拓扑渲染、插件加密打包驱动             |
+| 1. 操作控制端 control-tauri (Tauri 1.x + Vue 3)              |
+|    已实现: agent 列表/详情、命令下发、目录浏览、系统信息、    |
+|             任务状态轮询(get_task)、agent 生成表单、         |
+|             凭证 OS Keyring 托管                             |
+|    路线图: 拓扑图、多用户协同、插件打包                       |
 +------------------------------+------------------------------+
-                               | gRPC / Protocol Buffers
+                               | gRPC (proto/fei_control.proto, 11 RPC)
                                v
 +-------------------------------------------------------------+
-| 2. 中枢控制面 (Go Core + NATS Bus)                          |
-|    - 职责：会话持久化、任务队列调度、异步编译网关通信       |
+| 2. 中枢控制面 control-plane/go_core (Go + NATS)              |
+|    已实现: 会话/任务状态机、结果按 task_id 关联回填、         |
+|             JSON 快照持久化、命令到沙箱帧的映射、             |
+|             ListDirectory/Upload/Download 带结果等待          |
 +------------------------------+------------------------------+
-                               | NATS Broker 物理隔离
+                               | NATS (fei.event.* / fei.cmd.*)
                                v
 +-------------------------------------------------------------+
-| 3. 前线接入节点 (Go Gateway-Node)                           |
-|    - 职责：443端口无状态接入、mTLS 1.3、动态追加随机 Padding |
+| 3. 前线接入节点 gateway/go_gateway (Go)                       |
+|    已实现: TLS 1.2/1.3 终结(证书已正确加载)、                |
+|             -mtls-mode require|request|none、-dev 明文模式、  |
+|             帧编解码+AEAD、每会话防重放(seq 严格递增)、      |
+|             TxSeq/RxSeq 分离、NATS 桥接                      |
 +------------------------------+------------------------------+
-                               | 双层加密密文流
+                               | FEI v3 二进制协议(全帧密封)
                                v
 +-------------------------------------------------------------+
-| 4. 远程端点内核 (純 x64 ASM Entry + Rust no_std Sandbox)     |
-|    - 职责：ASM 负责常驻与流解析，子进程影子宿主运行 Rust 插件 |
+| 4. 植入端 agents/x64_asm (NASM) + rust_no_std_sandbox        |
+|    已实现: PEB 动态解析、Schannel TLS、ChaCha20-Poly1305     |
+|             全帧密封、随机 padding、连接监督重连、            |
+|             沙箱管道投递、管道读 10s 超时、退出前密钥擦除      |
+|    路线图: TLS 模式收包流状态(见 Known issues)               |
 +-------------------------------------------------------------+
-
 ```
 
----
-
-## 📡 二、 统一网络层：36字节变长二进制流协议
-
-网络层全面废除 JSON、XML 等结构化明文，采用带**流式防粘包校验与动态混淆长度**的二进制流。
-
-### 1. 包头字节对齐结构 (FEI_HEADER_V3)
-
-所有通过网络层发送的底层报文，必须严格在内存中对齐以下 36 字节边界：
-
-```c
-typedef struct __attribute__((packed)) {
-    uint32_t magic;         // 0x00: 固定魔术字：0x46454900 ("FEI\0")
-    uint16_t proto_ver;     // 0x04: 协议版本号：当前代号 0x0300 (v3.0.0)
-    uint16_t type;          // 0x06: 状态类型：0x01心跳, 0x02插件载入, 0x03执行回传, 0x04异常, 0x05销毁
-    uint32_t seq;           // 0x08: 防重放锁：基于单次会话 Nonce 与 Counter 的滚动哈希值
-    uint32_t length;        // 0x0C: 核心 Payload 真实物理长度（解密后长度）
-    uint16_t padding_len;   // 0x10: 尾部填充的垃圾数据长度（0 ~ 128 字节）
-    uint8_t  agent_id[8];   // 0x12: 裁剪后的受控端 8 字节唯一物理设备指纹
-    uint8_t  timestamp[8];  // 0x1A: 大端序 64 位毫秒级时间戳
-} FEI_HEADER_V3; // 严格占用 36 字节空间
-
-```
-
-### 2. 双层流式全密态策略
-
-* **外层（传输层）：** 强制使用 `mTLS 1.3`（双向 TLS 1.3）安全包。Go 网关持有合法证书，端点通过底层网络栈（Windows Schannel / Unix OpenSSL）直接对接。
-* **内层（应用层）：** 即使 TLS 隧道被中途解密，其 Payload 区域在发送前必须通过 **ChaCha20-Poly1305** 算法进行全流加密。
-* **抗特征混淆：** 每次发包时，Go 网关或端点必须在真实 Payload 尾部随机附加长度为 `padding_len` 的垃圾字节，导致物理 TCP 层的网络包大小在全流量审计（NDR）设备眼里呈现完全随机的动态分布。
+NATS 总线(`gateway/nats_bus`)是**审计消费者**而非内嵌 server,部署时需
+外部 `nats-server`。
 
 ---
 
-## 💀 三、 受控端 (Agent) 与影子沙箱开发规范
+## 二、 FEI v3 网络协议(实现即规范)
 
-端点设计坚持“通信与执行彻底分离”原则，保证主进程永远不因为下发组件的质量问题而发生崩溃。
+36 字节包头,除 timestamp 外全部小端:
 
-### 1. 主内核 (ASM Entry Core)
+| 偏移 | 宽度 | 字段 | 说明 |
+|------|------|------|------|
+| 0x00 | 4 | magic | `0x46454900` ("FEI\0") |
+| 0x04 | 2 | proto_ver | `0x0300` |
+| 0x06 | 2 | type | 0x01 心跳 / 0x02 plugin_load / 0x03 exec_return / 0x04 exception / 0x05 destroy |
+| 0x08 | 4 | seq | 单调递增,参与 nonce 派生 |
+| 0x0C | 4 | length | 解密后载荷长度 |
+| 0x10 | 2 | padding_len | 0..128 随机尾部垃圾长度 |
+| 0x12 | 8 | agent_id | 设备指纹 |
+| 0x1A | 8 | timestamp | 大端毫秒时间戳 |
+| 0x22 | 2 | (保留) | 恒为 0,两实现一致,作为 AAD 一部分 |
 
-* **语言与约束：** 必须使用纯 `x64 NASM` 编写，彻底剥离 CRT 依赖（Link 时指定 `/nodefaultlib`）。
-* **核心职责：** 只做两件事：与 Go 网关保持 TLS 连接以维持心跳；解析 36 字节包头，处理 ChaCha20 解密。
-* **物理体积指标：** 独立编译剪裁后物理大小必须 **小于 15KB**。
+**内层 AEAD(与 RFC 8439 / Go x/crypto 逐字节互通,由
+`agents/x64_asm/test.asm` + `tools/aeadtest` 六项测试锁定):**
 
-### 2. 执行沙箱 (Rust no_std Sandbox)
+- ChaCha20-Poly1305,key = 32 字节 PSK
+- nonce = `le32(seq) || agent_id`(12 字节,确定性派生,两端一致)
+- AAD = 完整 36 字节包头(含 2 保留字节)
+- MAC 数据 = `pad0(header) || pad0(ciphertext) || le64(36) || le64(len)`
+  (RFC 8439 §2.8 布局;**没有**明文心跳快捷路径——v3.1 起每帧含 tag)
+- 密文后跟 padding_len 字节随机垃圾(ASM 端用 RDTSC,流量整形用途)
 
-* **技术规范：** 远程下发的所有功能组件（文件测控、系统监控、任务执行等）严禁直接在主内核线程中 `call rax` 共享地址空间执行。
-* **隔离调用流控：**
-1. 主内核接收到 `0x02 (插件载入)` 命令后，通过底层系统调用拉起一个合规的系统自带常驻进程（如挂起状态的远程运维傀儡进程）。
-2. 主内核通过 **匿名管道 (Anonymous Pipes)** 或 **内存映射 (Section 挂载)** 将解密后的 Rust no_std 动态模块投递给该子进程。
-3. 组件使用 `Rust no_std` 编写，不带 Rust 重量级运行时，编译为位置无关代码（PIC），但拥有强效的编译期内存安全保护。
-4. 插件在子进程内执行，若发生任何未捕获的 CPU 异常（如越界、空指针），**仅有子进程被系统中止，常驻主内核毫发无损**，可通过下一轮心跳向中枢报告 `0x04 (异常)` 状态码。
-5. 任务结束后，主内核发起系统调用完全擦除（Wipe 刷写 0x00）该临时内存页，不留任何内存取证痕迹。
+**防重放:** 网关每会话维护 RxSeq,`seq <= RxSeq` 的帧丢弃并记日志。
+网关自身下发(ACK/命令)使用独立 TxSeq,不污染接收侧判定。
 
-
-
----
-
-## 🔄 四、 控制面与网关微服务解耦规范 (Control Plane)
-
-中枢服务器必须实现彻底的“无状态”前线接入与后端解耦。
-
-### 1. 前线接入节点 (Go Gateway-Node)
-
-* **无状态运行：** 前线网关仅作为流量解密中转站。在 Go 语言中利用 `net/http` 或原生 `TCP Sockets` 维护长连接。
-* **解包过滤状态机：** 网关接收到数据后，通过流式状态机校验 `magic` 与 `proto_ver`。若不合规，**立刻强行断开套接字，防止被主动扫描测绘**。合规的数据经由解密后，直接将其打包为事件对象发布至后方的 NATS 总线。
-
-### 2. 异步中枢与独立编译 (Core & Compiler)
-
-* **NATS 物理隔离：** 接入网关与核心控制逻辑（Session Core）之间通过 `NATS Broker` 隔离。哪怕前线网关服务器被防守方定点清除，控制面核心数据和在线会话也绝不丢失。
-* **自动化混淆流水线：** 控制端（Tauri）请求生成新端点时，Go 编译 Worker 从内部模板库调取 `entry.asm` 源码，利用内置正则动态对关键跳转标签（Labels）和内部常数进行全随机重命名重构（控制流平坦化混淆），然后拉起容器化的 `nasm` 进行实时交叉编译，确保每一份端点 PE 文件的 HASH 与结构完全异构。
+**已知限制:** 单一全局 PSK,无 per-agent 派生与轮换;nonce 确定性派生
+意味着 seq 回绕即密钥流重用——升级 PSK 体系时必须同步改两端。
 
 ---
 
-## 🖥️ 五、 控制端（Tauri + Vue3）开发规范
+## 三、 植入端开发规范
 
-* **技术栈：** 后端采用 `Rust (Tauri Core)` 确保高算力安全与本地内存数据混淆；前端采用 `Vue 3 + Vite` 构建响应式大屏拓扑。
-* **通信协议：** Tauri 进程与后方 Go Core API Gateway 之间强制使用 `gRPC` 进行强类型契约通信，接口定义文件（`.proto`）统一托管。
-* **安全性要求：** 所有保存在本地的敏感凭证、CA 证书私钥，必须通过 Rust 调用本地系统的安全密钥环（Keyring）进行加密托管，严禁明文落盘。
+### 主内核(x64 NASM,目标 <15KB,实测 12-13KB)
+
+- 纯 NASM,`/NODEFAULTLIB`,自建 kernel32 导入库(`kernel32.def` +
+  `lib.exe /def:` 生成,随仓库分发 def 源)。
+- 函数解析:先 `LoadLibraryA("ws2_32.dll")` 再 PEB 遍历
+  (InLoadOrderModuleList,`gs:[0x60]` → Ldr+0x10;BaseDllName 比较
+  按字符数,DllBase 在 +0x30)。
+- SSPI 调用注意:`InitializeSecurityContextA` 栈参数从 +32 起每 8 字节
+  一槽;`DecryptMessage(phContext, pMessage, seq, pfQOP)` 的参数顺序
+  **与 EncryptMessage 不同**(pMessage 是第 2 参)——这是历史踩坑点,
+  改动前先看 `entry.asm` 内注释。
+- 栈对齐:任何含 API 调用的函数,调用瞬间 rsp 必须模 16 为 0。植入端
+  历史上四个崩溃(Schannel、EncryptMessage、PeekNamedPipe 路径)全部
+  源于对齐错误——push 数量 + sub 总量必须凑成 16 的倍数。
+- 指针运算:对 resd 变量做 `add reg, [dword变量]` 会把相邻 4 字节当
+  高位并入指针——一律先 `mov eax, [var]` 再 `add reg, rax`。
+- 帧接收:staging 采用**追加式**填充 + 帧边界压缩 + 半帧回滚
+  (`recv_saved_off`),半包到达时回滚 offset 重试而不是错位。
+- 连接监督:连续 3 次发送失败 → 拆链(cleanup_tls + cleanup_stream)→
+  冷却 3 秒重连。PSK 不随会话销毁擦除(监督器还要用),最终由进程退出
+  回收。
+- 构建模式:默认 Schannel TLS;`-D PLAIN_TCP` 编译明文传输版(配合
+  网关 `-dev`,内层 AEAD 仍然全帧密封)。**当前发布默认走 PLAIN_TCP**,
+  TLS 模式收包流状态待修(见 Known issues)。
+
+### 执行沙箱(Rust no_std,~11KB exe)
+
+- **禁止裸 syscall 号**(v3.0 的硬编码号跨版本即碎,且内联汇编写栈参数
+  与 Rust prologue 相互破坏)。一律通过 PEB 解析 ntdll 导出调用:
+  `NtReadFile/NtWriteFile/NtClose/NtQuerySystemInformation/NtOpenFile/
+  NtCreateFile/NtQueryDirectoryFile/NtTerminateProcess`。
+- 同步文件句柄的 DesiredAccess 必须含 `SYNCHRONIZE`
+  (0x00100000),否则 NtOpenFile 直接拒。
+- 目录枚举:`ReturnSingleEntry=1` 逐条循环,终止状态是
+  **STATUS_NO_MORE_FILES (0x80000006)** ——不是 NO_MORE_ENTRIES
+  (0x8000001A),两者容易搞混(本项目真实踩坑)。
+- 管道协议(与主内核对齐):
+  - 请求 `[cmd u8][len u32 LE][payload]`
+  - 响应 `[resp_len u32 LE][resp bytes]`(单次写,JSON)
+  - cmd: 0x01 sysinfo / 0x02 process_list / 0x03 dir_list /
+    0x04 file_read / 0x05 file_write / 0x06 execute
+- `execute`:PEB 解析 kernel32!CreateProcessA,stdout 管道捕获,
+  **30 秒上限后 TerminateProcess**,输出捕获上限 64KB。
+- panic 处理器**禁止 `loop {}`**(历史上把 CPU 打到 100%):panic 时
+  向管道写 `[[PANIC]] line:N` 标记后走三级退出链
+  (NtTerminateProcess → ExitProcess → ud2)。
+- 堆:静态 4MB bump allocator(process_list 的重试缓冲需要 ~2MB,
+  1MB 必然耗尽——真实事故)。
+- 验证:`tools/sandboxtest` 七项直连测试 + EOF 干净退出,提交前必须全绿。
 
 ---
 
-## 🛠️ 团队首期研发对齐（里程碑 1）
+## 四、 控制面与网关规范
 
-为了防止多小组并行开发时接口无法对齐，团队第一阶段的研发重点必须聚焦于“网络生命周期的神经网络”：
+- 网关 TLS:MinVersion TLS1.2(Win10 Schannel 客户端上限)/ Max 1.3;
+  服务器证书**必须**真实加载进 tls.Config(历史致命 bug:`-cert` 参数
+  定义了却从未使用,生产模式握手必败)。
+- `fei.cmd.<agentID>` 回调**不得**在持有 session.mu 的状态下再调用会
+  内部加锁同一互斥锁的处理函数(Go mutex 不可重入——本项目曾因此
+  死锁全部命令投递而不报任何错)。
+- go_core 命令映射:语义命令名 → 沙箱帧,经 plugin_load(0x02)通道;
+  destroy(0x05)除外。ListDirectory/Upload/Download 带 5-8s 结果等待,
+  超时返回 queued 语义。
 
-1. **端点组：** 编写 `entry.asm`，实现通过 `gs:[60h]` 遍历 PEB 获取系统核心网络函数指针，打通基础的 mTLS 1.3 握手流。
-2. **网关组：** 使用 `Go` 编写前线接收状态机，实现 36 字节包头的流式解包（处理粘包、断包），并能动态计算和附加随机 `padding_len` 的垃圾数据。
-3. **协议组：** 产出统一的 ChaCha20-Poly1305 预共享密钥（PSK）对齐标准，确保 Go 加密的数据能被纯汇编无误解密。
+---
 
-这份文档将作为团队架构的“宪法”，在后续的模块细化和代码产出中，任何偏离此白皮书边界的设计均需提交架构委员会重新评审。
+## 五、 编译流水线(compiler_worker)规范
+
+- `-emit-pe`(默认):自研 COFF→PE64 链接器(`pelinker.go`)输出独立
+  exe。关键实现约束(全部真实踩坑):
+  - COFF 重定位项步长 **10 字节**(VA+Index+Type 紧密打包)
+  - PE32+ 栈/堆四字段是 **8 字节**
+  - IMAGE_IMPORT_DESCRIPTOR 是 **20 字节** 结构(Name@+12,
+    FirstThunk@+16),名字符串放 rdata 尾部、+12 处放 RVA
+  - PE 头一律**偏移寻址写入**,不按顺序 append(顺序法错过一次 16 字节)
+- 混淆变换的正确性纪律:
+  - XOR 常数拆分必须生成 `c = orig^a^b` 且**发射前自校验**
+    `(c^a)^b == orig`(旧实现直接静默改错常数,把 C2 地址改成了随机
+    外网 IP)
+  - NASM 局部标签(`.` 开头)不得重命名(跨函数撞名)
+  - 控制流平坦化默认关闭(`-flatten`),其局部标签 dispatcher 无法
+    通过多函数汇编
+- **二进制多态**:仅靠源码级改写(等长标签、XOR 拆分)会被 NASM 折叠
+  回逐字节相同的机器码。真正的哈希差异来自:变长标签名 + 指令间随机
+  NOP 插入。每次构建的产物必须通过活体命令电池验证(已验证混淆 PE
+  心跳 + sysinfo 回传)。
+
+---
+
+## 六、 交付前验证清单(提交门禁)
+
+1. `tools/aeadtest` 生成向量 → `test.asm` 六项全绿
+2. `tools/sandboxtest` 七项全绿 + EOF 干净退出
+3. `gateway/go_gateway` `go test` 全过
+4. 活体栈(nats + control_plane + gateway -dev + agent):
+   心跳 30s 稳定、sysinfo/process_list/dir_list/shell 回传、
+   任务状态 completed
+5. compiler_worker 连续三次构建 → 三个不同 SHA256,且最新构建过活体电池
+
+---
+
+## 七、 路线图(未实现,禁止在文档中当成已有能力宣传)
+
+- 植入端 TLS 模式收包流状态(DecryptMessage 参数已修,流状态待查)
+- PSK 体系升级(per-agent 派生 / 轮换)
+- 模板库 + 容器化 nasm 的全自动生成服务
+- 控制台拓扑图、多用户协同、插件加密打包
+- 分块文件传输(当前单发 ≤7KB)
