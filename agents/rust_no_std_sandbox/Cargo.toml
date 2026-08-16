@@ -1,0 +1,31 @@
+[workspace]
+
+[package]
+name = "fei-agent-sandbox"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "sandbox"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
+
+[profile.release.build-override]
+opt-level = "z"
+
+[package.metadata.build]
+rustflags = ["-C", "relocation-model=pic", "-C", "code-model=small", "-C", "link-args=-Wl,-static"]

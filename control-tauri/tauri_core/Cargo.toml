@@ -1,0 +1,32 @@
+[package]
+name = "fei-control-tauri-core"
+version = "0.1.0"
+description = "Fei Control Panel Core"
+edition = "2021"
+
+[lib]
+name = "fei_control_core"
+crate-type = ["lib"]
+
+[[bin]]
+name = "fei-control-panel"
+path = "src/main.rs"
+
+[dependencies]
+tauri = { version = "1.6", features = ["api-all"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-nats = "0.37"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.11"
+prost = "0.12"
+http = "0.2"
+keyring = { version = "2.3", features = ["platform-all"] }
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+tonic-build = "0.11"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

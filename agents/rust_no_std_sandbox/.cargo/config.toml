@@ -1,0 +1,7 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "code-model=small",
+    "-C", "link-arg=/ENTRY:_start",
+    "-C", "link-arg=/SUBSYSTEM:CONSOLE"
+]

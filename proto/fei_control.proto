@@ -1,0 +1,166 @@
+syntax = "proto3";
+
+package fei.control;
+
+option go_package = "fei/control-plane/proto";
+
+service FeiControlService {
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  rpc SendCommand(SendCommandRequest) returns (SendCommandResponse);
+  rpc GetSystemInfo(GetSystemInfoRequest) returns (GetSystemInfoResponse);
+  rpc GetSystemMetrics(GetSystemMetricsRequest) returns (GetSystemMetricsResponse);
+  rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+  rpc UploadFile(UploadFileRequest) returns (UploadFileResponse);
+  rpc DownloadFile(DownloadFileRequest) returns (DownloadFileResponse);
+  rpc ListPlugins(ListPluginsRequest) returns (ListPluginsResponse);
+  rpc InstallPlugin(InstallPluginRequest) returns (InstallPluginResponse);
+  rpc UninstallPlugin(UninstallPluginRequest) returns (UninstallPluginResponse);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+}
+
+message AgentInfo {
+  string id = 1;
+  string hostname = 2;
+  string ip_address = 3;
+  string os_info = 4;
+  string last_seen = 5;
+  uint32 state = 6;
+}
+
+message ListAgentsRequest {}
+
+message ListAgentsResponse {
+  bool success = 1;
+  string error = 2;
+  repeated AgentInfo agents = 3;
+  int32 count = 4;
+}
+
+message SendCommandRequest {
+  string agent_id = 1;
+  string command = 2;
+  repeated string parameters = 3;
+}
+
+message SendCommandResponse {
+  bool success = 1;
+  string error = 2;
+  string task_id = 3;
+  string result = 4;
+}
+
+message GetSystemInfoRequest {
+  string agent_id = 1;
+}
+
+message GetSystemInfoResponse {
+  bool success = 1;
+  string error = 2;
+  AgentInfo agent = 3;
+}
+
+message GetSystemMetricsRequest {
+  string agent_id = 1;
+}
+
+message GetSystemMetricsResponse {
+  bool success = 1;
+  string error = 2;
+  double cpu_usage = 3;
+  double memory_usage = 4;
+  double disk_usage = 5;
+}
+
+message FileEntry {
+  string name = 1;
+  uint64 size = 2;
+  bool is_directory = 3;
+}
+
+message ListDirectoryRequest {
+  string agent_id = 1;
+  string path = 2;
+}
+
+message ListDirectoryResponse {
+  bool success = 1;
+  string error = 2;
+  string path = 3;
+  repeated FileEntry files = 4;
+}
+
+message UploadFileRequest {
+  string agent_id = 1;
+  string local_path = 2;
+  string remote_path = 3;
+}
+
+message UploadFileResponse {
+  bool success = 1;
+  string error = 2;
+  string message = 3;
+}
+
+message DownloadFileRequest {
+  string agent_id = 1;
+  string remote_path = 2;
+  string local_path = 3;
+}
+
+message DownloadFileResponse {
+  bool success = 1;
+  string error = 2;
+  string message = 3;
+}
+
+message PluginInfo {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  string status = 4;
+  string description = 5;
+}
+
+message ListPluginsRequest {
+  string agent_id = 1;
+}
+
+message ListPluginsResponse {
+  bool success = 1;
+  string error = 2;
+  repeated PluginInfo plugins = 3;
+}
+
+message InstallPluginRequest {
+  string agent_id = 1;
+  string plugin_id = 2;
+}
+
+message InstallPluginResponse {
+  bool success = 1;
+  string error = 2;
+  string message = 3;
+}
+
+message UninstallPluginRequest {
+  string agent_id = 1;
+  string plugin_id = 2;
+}
+
+message UninstallPluginResponse {
+  bool success = 1;
+  string error = 2;
+  string message = 3;
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message GetTaskResponse {
+  bool success = 1;
+  string error = 2;
+  string task_id = 3;
+  string status = 4;
+  bytes result = 5;
+}

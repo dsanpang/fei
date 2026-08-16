@@ -1,0 +1,21 @@
+LIBRARY kernel32.dll
+EXPORTS
+    GetSystemTimeAsFileTime
+    ExitProcess
+    Sleep
+    CreateProcessW
+    ResumeThread
+    CreatePipe
+    WriteFile
+    ReadFile
+    CloseHandle
+    VirtualAlloc
+    VirtualFree
+    WaitForSingleObject
+    GetExitCodeProcess
+    TerminateProcess
+    LoadLibraryA
+    GetProcAddress
+    GetStdHandle
+    GetLastError
+    SetHandleInformation

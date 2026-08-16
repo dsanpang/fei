@@ -1,0 +1,76 @@
+version: "3.9"
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: fei-nats
+    command: ["-js", "-m", "8222", "-p", "4222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - fei-net
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fei-control-plane
+    command: ["/app/control_plane", "-nats", "nats://nats:4222"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - fei-net
+
+  nats-bus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fei-nats-bus
+    command: ["/app/nats_bus", "-nats", "nats://nats:4222"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - fei-net
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fei-gateway
+    command:
+      - /app/gateway
+      - -listen
+      - :4433
+      - -nats
+      - nats://nats:4222
+      - -cert
+      - /app/certs/server-cert.pem
+      - -key
+      - /app/certs/server-key.pem
+      - -ca
+      - /app/certs/ca-cert.pem
+      - -psk
+      - /app/certs/psk.bin
+    volumes:
+      - ./certs:/app/certs:ro
+    ports:
+      - "4433:4433"
+    depends_on:
+      - nats
+    restart: unless-stopped
+    networks:
+      - fei-net
+
+networks:
+  fei-net:
+    driver: bridge

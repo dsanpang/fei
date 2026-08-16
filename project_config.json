@@ -1,0 +1,74 @@
+{
+  "project": {
+    "name": "Fei Distributed Control Platform",
+    "version": "3.0.0",
+    "description": "A sophisticated distributed control and remote management platform",
+    "classification": "Internal Technical Project"
+  },
+  "modules": {
+    "agents": {
+      "type": "endpoint",
+      "language": "x64_asm + rust_no_std",
+      "location": "./agents",
+      "size_limit_kb": 15,
+      "protocols": ["fei_v3_binary", "mtls_1.3", "chacha20_poly1305"]
+    },
+    "gateway": {
+      "type": "communication_layer",
+      "language": "go",
+      "location": "./gateway",
+      "components": ["go_gateway", "nats_bus"],
+      "ports": [4433],
+      "protocols": ["mtls_1.3", "chacha20_poly1305", "nats_bus"]
+    },
+    "control_plane": {
+      "type": "core_logic",
+      "language": "go",
+      "location": "./control-plane",
+      "components": ["go_core", "compiler_worker"],
+      "protocols": ["nats_bus", "grpc"]
+    },
+    "control_tauri": {
+      "type": "ui_control",
+      "language": "rust + vue3",
+      "location": "./control-tauri",
+      "components": ["tauri_core", "vue_frontend"],
+      "protocols": ["grpc"]
+    }
+  },
+  "network_protocol": {
+    "name": "FEI_HEADER_V3",
+    "size_bytes": 36,
+    "fields": [
+      {"name": "magic", "type": "uint32", "offset": 0},
+      {"name": "proto_ver", "type": "uint16", "offset": 4},
+      {"name": "type", "type": "uint16", "offset": 6},
+      {"name": "seq", "type": "uint32", "offset": 8},
+      {"name": "length", "type": "uint32", "offset": 12},
+      {"name": "padding_len", "type": "uint16", "offset": 16},
+      {"name": "agent_id", "type": "uint8[8]", "offset": 18},
+      {"name": "timestamp", "type": "uint8[8]", "offset": 26}
+    ],
+    "message_types": {
+      "heartbeat": 0x01,
+      "plugin_load": 0x02,
+      "exec_return": 0x03,
+      "exception": 0x04,
+      "destroy": 0x05
+    }
+  },
+  "security": {
+    "transport_encryption": "mtls_1.3",
+    "application_encryption": "chacha20-poly1305",
+    "anti_forensics": "random_padding_obfuscation",
+    "isolation": "process_separation_with_shadow_sandbox"
+  },
+  "build": {
+    "output_dir": "./bin",
+    "dependencies": {
+      "go_modules": ["github.com/nats-io/nats.go"],
+      "rust_crates": [],
+      "assembly_compiler": "nasm"
+    }
+  }
+}

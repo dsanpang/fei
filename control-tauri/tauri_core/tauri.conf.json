@@ -1,0 +1,71 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:5173",
+    "distDir": "../vue_frontend/dist",
+    "withGlobalTauri": false
+  },
+  "package": {
+    "productName": "Fei Control Panel",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": true,
+      "fs": {
+        "all": true,
+        "scope": ["$APPDATA/**", "$DOWNLOAD/**", "$DESKTOP/**"]
+      },
+      "dialog": {
+        "all": true
+      },
+      "shell": {
+        "all": false,
+        "open": true
+      },
+      "http": {
+        "all": false
+      },
+      "notification": {
+        "all": true
+      },
+      "clipboard": {
+        "all": true
+      },
+      "window": {
+        "all": true
+      }
+    },
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.fei.platform",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ]
+    },
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+    },
+    "windows": [
+      {
+        "title": "蜚 (Fei) 控制面板",
+        "width": 1280,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": true,
+        "focus": true
+      }
+    ],
+    "updater": {
+      "active": false
+    }
+  }
+}
