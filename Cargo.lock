@@ -1302,10 +1302,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fei-agent-sandbox"
-version = "0.1.0"
-
-[[package]]
 name = "fei-control-tauri-core"
 version = "0.1.0"
 dependencies = [

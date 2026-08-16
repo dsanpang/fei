@@ -27,6 +27,7 @@ extern TerminateProcess
 extern LoadLibraryA
 extern GetProcAddress
 extern GetLastError
+extern PeekNamedPipe
 extern SetHandleInformation
 
 ; ======================== Constants ========================================
@@ -576,7 +577,12 @@ tls_connect:
 tls_send:                           ; rcx = buffer, rdx = length
     jmp send_raw
 
-tls_recv:                           ; rcx = out, edx = requested
+tls_recv:                           ; rcx = out, edx = requested -> min(available)
+    ; Staging invariants (PLAIN_TCP):
+    ;  - refills APPEND at [tls_decrypted_len], never overwrite
+    ;  - compaction (off=len=0) happens only in recv_command at frame start
+    ;  => bytes below tls_decrypted_off stay valid, so recv_command can roll
+    ;     back a partially-consumed frame and retry without desync
     push rbx
     push rsi
     push rdi
@@ -586,22 +592,28 @@ tls_recv:                           ; rcx = out, edx = requested
     mov eax, [tls_decrypted_len]
     sub eax, [tls_decrypted_off]
     test eax, eax
-    jg .pr_have
-    mov dword [tls_decrypted_len], 0
-    mov dword [tls_decrypted_off], 0
+    jg .pr_copy_setup
+    ; staging empty: append new bytes (cap at 32768)
+    mov eax, [tls_decrypted_len]
+    cmp eax, 32768
+    jge .pr_none
     lea rcx, [tls_decrypted_buf]
+    add rcx, rax
     mov edx, 32768
+    sub edx, eax
     call recv_some
     test eax, eax
     jle .pr_none
-    mov [tls_decrypted_len], eax
-.pr_have:
+    add [tls_decrypted_len], eax
+.pr_copy_setup:
     mov eax, [tls_decrypted_len]
     sub eax, [tls_decrypted_off]
     cmp ebx, eax
     jle .pr_ok
-    mov ebx, eax
+    mov ebx, eax                    ; clamp to available
 .pr_ok:
+    test ebx, ebx
+    jz .pr_none
     lea rsi, [tls_decrypted_buf]
     mov eax, [tls_decrypted_off]
     add rsi, rax
@@ -955,9 +967,8 @@ tls_recv:
     ret
 
 .tr_read_more:
-    ; Read encrypted data from socket
-    mov dword [tls_decrypted_len], 0
-    mov dword [tls_decrypted_off], 0
+    ; decrypted staging is append-only (frame-boundary compaction happens
+    ; in recv_command), so partial-frame rollback stays valid
 
 .tr_loop:
     ; Read more encrypted data
@@ -1001,11 +1012,12 @@ tls_recv:
     lea rax, [rsp + 16]
     mov qword [rsp + 8], rax
 
-    ; DecryptMessage
+    ; DecryptMessage(phContext, pMessage, MessageSeqNo, pfQOP)
+    ; NOTE: argument order differs from EncryptMessage (pMessage is 2nd here)
     lea rcx, [hCtxt]
-    mov edx, 0
-    mov r8, rsp
-    mov r9d, 0
+    mov rdx, rsp                    ; pMessage = &SecBufferDesc
+    xor r8d, r8d                    ; MessageSeqNo = 0
+    xor r9d, r9d                    ; pfQOP = NULL (not needed)
     call [ptr_DecryptMessage]
 
     ; Check for SEC_E_INCOMPLETE_MESSAGE
@@ -1029,11 +1041,15 @@ tls_recv:
     mov rsi, [rsi + 8]
 
 .tr_copy_decrypted:
+    ; append new plaintext at the current fill level (32-bit load via reg:
+    ; [tls_decrypted_len] is a dword, a qword add would bleed its neighbor)
     mov ecx, eax
-    mov [tls_decrypted_len], eax
-    mov dword [tls_decrypted_off], 0
+    mov edx, eax
     lea rdi, [tls_decrypted_buf]
+    mov eax, [tls_decrypted_len]
+    add rdi, rax
     rep movsb
+    add [tls_decrypted_len], edx
 
     ; Handle EXTRA data buffer
     mov eax, [rsp + 32]             ; buffer[1].cbBuffer
@@ -1059,6 +1075,8 @@ tls_recv:
     mov ecx, eax
 .tr_ret_ok:
     lea rsi, [tls_decrypted_buf]
+    mov eax, [tls_decrypted_off]    ; append-only staging: valid data starts at off
+    add rsi, rax
     mov rdi, [rsp + 72]             ; output buffer
     rep movsb
     add [tls_decrypted_off], ecx
@@ -1189,16 +1207,8 @@ send_frame:
     mov [header_buf + 18], rax
     mov word [header_buf + 34], 0        ; reserved tail must stay zero
 
-    ; heartbeat fast path
-    cmp r12w, FEI_TYPE_HEARTBEAT
-    jne .seal
-    test r14d, r14d
-    jnz .seal
-    lea rcx, [header_buf]
-    mov edx, HEADER_SIZE
-    call tls_send
-    jmp .done
-
+    ; every frame is sealed — including empty heartbeats (the old
+    ; plaintext fast path let unauthenticated bare headers through)
 .seal:
     ; nonce = le32(seq) || agent_id
     mov [cc_nonce], r15d
@@ -2361,8 +2371,15 @@ tls_recv_exact:
 ; ===========================================================================
 recv_command:
     sub rsp, 72
-    ; snapshot the staging offset: if a partial frame arrives we roll back
-    ; so the bytes are retried on the next pass instead of desyncing
+    ; frame-boundary compaction: safe only when the staging buffer is fully
+    ; drained (no partial frame pending). Appends never overwrite, so the
+    ; snapshot below stays valid for rollback until the frame completes.
+    mov eax, [tls_decrypted_len]
+    cmp eax, [tls_decrypted_off]
+    jne .rc_no_compact
+    mov dword [tls_decrypted_len], 0
+    mov dword [tls_decrypted_off], 0
+.rc_no_compact:
     mov eax, [tls_decrypted_off]
     mov [recv_saved_off], eax
 
@@ -2715,52 +2732,91 @@ sandbox_send:
     ret
 
 ; ===========================================================================
-; sandbox_recv_exact: read exactly edx bytes from sandbox stdout into rcx
-; Returns 1 on success, 0 on failure/EOF
+; sandbox_recv_exact: read exactly edx bytes from sandbox stdout into rcx.
+; Polls PeekNamedPipe with a 10 s deadline so a hung sandbox can never block
+; the kernel forever (the old blocking ReadFile deadlocked the whole agent).
+; Returns 1 on success, 0 on failure/timeout/EOF
 ; ===========================================================================
+SB_TIMEOUT_POLLS   equ 200               ; 200 x 50 ms = 10 s
+
 sandbox_recv_exact:
-    sub rsp, 56
     push rbx
     push rsi
+    push r15
+    sub rsp, 64                     ; 3 pushes + 64 = 88: aligned at calls
 
-    mov rsi, rcx                ; output buffer
-    mov ebx, edx                ; remaining
-.sre_loop:
+    mov rsi, rcx                    ; output buffer
+    mov ebx, edx                    ; remaining
+    mov r15d, SB_TIMEOUT_POLLS
+.sre_poll:
     test ebx, ebx
     jz .sre_done
 
     mov rcx, [pipe_stdout_read]
     test rcx, rcx
-    jz .fail
+    jz .sre_fail
+    ; is the sandbox process still alive? broken pipe otherwise
+    mov rcx, [sandbox_hprocess]
+    mov edx, 0
+    call WaitForSingleObject
+    test eax, eax
+    jz .sre_fail                    ; sandbox exited
 
-    mov rdx, rsi                ; buffer
-    mov r8, rbx                 ; bytes to read
+    ; PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)
+    mov rcx, [pipe_stdout_read]
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    lea rax, [pipe_bytes_read]
+    mov [rsp + 32], rax
+    mov qword [rsp + 40], 0
+    call PeekNamedPipe
+    test eax, eax
+    jz .sre_fail                    ; pipe broken
+    cmp dword [pipe_bytes_read], 0
+    jle .sre_wait
+
+    ; read min(avail, remaining)
+    mov r8d, [pipe_bytes_read]
+    cmp r8d, ebx
+    jbe .sre_read
+    mov r8d, ebx
+.sre_read:
+    mov rcx, [pipe_stdout_read]
+    mov rdx, rsi
     lea r9, [pipe_bytes_read]
-    mov qword [rsp + 32], 0     ; lpOverlapped = NULL
+    mov qword [rsp + 32], 0
     call ReadFile
     test eax, eax
-    jz .fail
-
+    jz .sre_fail
     mov eax, [pipe_bytes_read]
     test eax, eax
-    jz .fail                    ; EOF (sandbox closed the pipe)
-
+    jz .sre_fail                    ; EOF
     add rsi, rax
     sub ebx, eax
-    jmp .sre_loop
+    jmp .sre_poll
+
+.sre_wait:
+    dec r15d
+    jz .sre_fail
+    mov ecx, 50
+    call Sleep
+    jmp .sre_poll
 
 .sre_done:
+    mov eax, 1
+    add rsp, 64
+    pop r15
     pop rsi
     pop rbx
-    mov eax, 1
-    add rsp, 56
     ret
 
-.fail:
+.sre_fail:
+    xor eax, eax
+    add rsp, 64
+    pop r15
     pop rsi
     pop rbx
-    xor eax, eax
-    add rsp, 56
     ret
 
 ; ===========================================================================
@@ -2864,11 +2920,8 @@ wipe_sensitive_data:
 ; ===========================================================================
 cleanup_all:
     sub rsp, 40
-
-    ; Wipe PSK
-    lea rcx, [psk]
-    mov rdx, 32
-    call wipe_sensitive_data
+    ; (PSK intentionally not wiped: the connection supervisor reconnects via
+    ; cleanup_tls/cleanup_stream; final cleanup is the OS reclaiming memory)
 
     ; Wipe ChaCha20 state + keystream + nonce
     lea rcx, [cc_state]

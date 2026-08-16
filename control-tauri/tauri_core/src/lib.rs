@@ -1,7 +1,8 @@
 pub mod credential_store;
 
 pub mod fei_proto {
-    tonic::include_proto!("fei_control");
+    tonic::include_proto!("fei.control");
+    pub use fei_control_service_client::FeiControlServiceClient;
 }
 
 pub mod commands {
@@ -11,8 +12,9 @@ pub mod commands {
     use tonic::transport::Channel;
     use crate::fei_proto::{
         FeiControlServiceClient, GetSystemInfoRequest, GetSystemMetricsRequest,
-        InstallPluginRequest, ListAgentsRequest, ListDirectoryRequest, ListPluginsRequest,
-        SendCommandRequest, UninstallPluginRequest, UploadFileRequest, DownloadFileRequest,
+        GetTaskRequest, InstallPluginRequest, ListAgentsRequest, ListDirectoryRequest,
+        ListPluginsRequest, SendCommandRequest, UninstallPluginRequest, UploadFileRequest,
+        DownloadFileRequest,
     };
 
     #[derive(Clone)]
@@ -108,6 +110,13 @@ pub mod commands {
         pub output_dir: String,
         pub template_dir: String,
         pub enable_obfuscation: bool,
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Debug)]
+    pub struct TaskStatus {
+        pub task_id: String,
+        pub status: String,
+        pub result: String,
     }
 
     #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -678,6 +687,35 @@ pub mod commands {
         uninstall_plugin_impl(&state, agent_id, plugin_id).await
     }
 
+    pub async fn get_task_impl(
+        state: &AppState,
+        task_id: String,
+    ) -> Result<TaskStatus, String> {
+        let mut client = get_grpc_client(state).await?;
+        let request = tonic::Request::new(GetTaskRequest { task_id: task_id.clone() });
+        let response = client
+            .get_task(request)
+            .await
+            .map_err(|e| format!("gRPC get_task: {}", e))?;
+        let resp = response.into_inner();
+        if !resp.success {
+            return Err(resp.error);
+        }
+        Ok(TaskStatus {
+            task_id: resp.task_id,
+            status: resp.status,
+            result: String::from_utf8_lossy(&resp.result).into_owned(),
+        })
+    }
+
+    #[tauri::command]
+    pub async fn get_task(
+        state: tauri::State<'_, AppState>,
+        task_id: String,
+    ) -> Result<TaskStatus, String> {
+        get_task_impl(&state, task_id).await
+    }
+
     #[tauri::command]
     pub async fn generate_agent(
         state: tauri::State<'_, AppState>,
@@ -688,13 +726,13 @@ pub mod commands {
 }
 
 pub use commands::{
-    AppState, AgentInfo, CommandRequest, CommandResponse, SystemMetrics,
+    AppState, AgentInfo, CommandRequest, CommandResponse, SystemMetrics, TaskStatus,
     DirectoryListing, PluginList, AgentConfig, AgentGenerateResult,
     connect_to_gateway, list_agents, send_command,
     get_system_info, get_system_metrics,
     list_directory, upload_file, download_file,
     list_plugins, install_plugin, uninstall_plugin,
-    generate_agent,
+    generate_agent, get_task,
 };
 
 pub fn init() {

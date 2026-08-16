@@ -163,9 +163,7 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	}
 
 	bodySize := int(hdr.Length) + int(hdr.PaddingLen)
-	if hdr.Type == TypeHeartbeat && bodySize == 0 {
-		return &Frame{Header: *hdr, Payload: nil}, nil
-	}
+	_ = bodySize
 
 	if bodySize > 0 {
 		body := make([]byte, bodySize)
@@ -192,9 +190,9 @@ func ReadEncryptedFrame(r io.Reader, psk []byte) (*Frame, error) {
 		return nil, err
 	}
 
-	if hdr.Type == TypeHeartbeat && hdr.Length == 0 && hdr.PaddingLen == 0 {
-		return &Frame{Header: *hdr, Payload: nil}, nil
-	}
+	// no plaintext fast path: every frame (including empty heartbeats)
+	// carries an AEAD tag, so nothing unauthenticated reaches the session
+	// logic
 
 	ciphertextSize := int(hdr.Length) + chacha20poly1305.Overhead
 	totalBodySize := ciphertextSize + int(hdr.PaddingLen)

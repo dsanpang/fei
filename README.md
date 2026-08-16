@@ -152,23 +152,32 @@ Sandbox commands (via the gRPC `SendCommand` or the console):
 
 This is an early open-source release; the following are open:
 
-1. **Schannel `DecryptMessage` crashes** the TLS-mode implant on Windows 10
-   (handshake and `EncryptMessage` work; receive-path decrypt faults inside
-   secur32). The implant therefore ships in `PLAIN_TCP` mode (gateway `-dev`,
-   inner AEAD intact). TLS/mTLS remains fully usable for Go-side components
-   (covered by the gateway's e2e tests).
-2. **Command round-trip instability**: heartbeats, registration, sandbox
-   spawn and event flow are verified end-to-end, but the
-   control-plane → gateway → implant command delivery path still has
-   reliability issues under sustained runs (frames can stall).
-3. Single PSK for all agents (no per-agent key derivation or rotation), and
-   the protocol's anti-replay `SessionContext` is implemented but not wired
-   into the gateway read path.
-4. Compiler worker emits raw position-independent shellcode, not a linked PE;
+1. **Schannel TLS receive path**: the implant's TLS handshake and
+   `EncryptMessage` work and `DecryptMessage` now has correct argument
+   ordering, but stream-state tracking across interleaved records is still
+   unstable — the TLS-mode implant stalls after a few frames. The shipped
+   default build is `PLAIN_TCP` (gateway `-dev`, inner ChaCha20-Poly1305 AEAD
+   intact, heartbeats sealed). TLS/mTLS remains fully usable for Go-side
+   components (covered by the gateway's e2e tests). The implant also has a
+   connection supervisor: 3 consecutive send failures trigger a clean
+   teardown + reconnect.
+2. Single PSK for all agents (no per-agent key derivation or rotation).
+   Anti-replay IS wired in: the gateway enforces strictly increasing per-
+   session sequence numbers and drops replays (logged).
+3. Compiler worker emits raw position-independent shellcode, not a linked PE;
    template library and containerized nasm from the original spec are not
    implemented.
-5. Console: no topology graph, multi-user collaboration or plugin packaging
+4. Console: no topology graph, multi-user collaboration or plugin packaging
    yet; file upload is single-shot (≤ ~7 KB) and download returns hex.
+5. The sandbox's `execute` output is capped at ~8 KB with no timeout kill;
+   sandbox panic → process terminate (never spins) is verified by
+   `tools/sandboxtest`.
+
+Verified end-to-end (PLAIN_TCP mode, this repository's test tooling):
+crypto interop suite (6/6), sandbox direct suite (7/7), gateway unit/e2e
+tests, and the full live command battery — sysinfo / process_list /
+dir_list / file_read / file_write / shell (with exec_return task
+completion) against a live agent.
 
 ## Detection notes for defenders
 

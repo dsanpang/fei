@@ -8,7 +8,7 @@ use core::panic::PanicInfo;
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_SIZE: usize = 1024 * 1024; // 1MB static heap
+const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4MB bump heap (process_list retry buffers need ~2MB)
 
 struct BumpAllocator {
     heap_start: usize,
@@ -66,8 +66,29 @@ static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
+fn panic(info: &PanicInfo) -> ! {
+    // surface the panic on the pipe, then terminate (never spin: the old
+    // handler burned a full core forever on heap exhaustion)
+    unsafe {
+        let (_, stdout) = fei_agent_sandbox::debug_std_handles();
+        fei_agent_sandbox::debug_write(stdout, b"
+[[PANIC]]
+");
+        // best effort: include the payload location if present
+        if let Some(loc) = info.location() {
+            let mut line = [b'0'; 8];
+            let mut n = loc.line();
+            let mut i = 8;
+            while n > 0 && i > 0 {
+                i -= 1;
+                line[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+            fei_agent_sandbox::debug_write(stdout, b"line:");
+            fei_agent_sandbox::debug_write(stdout, &line[i..]);
+        }
+    }
+    fei_agent_sandbox::exit_process(0xC0000409u32 as i32)
 }
 
 #[no_mangle]
@@ -78,16 +99,5 @@ pub extern "C" fn _start() -> ! {
 
     fei_agent_sandbox::run();
 
-    // NtTerminateProcess(NULL, 0): clean no_std exit, no CRT and no PEB walk
-    unsafe {
-        core::arch::asm!(
-            "mov r10, rcx",
-            "syscall",
-            in("rax") 0x2Cu64,
-            in("rcx") 0usize,
-            in("rdx") 0u32,
-            options(nomem, nostack)
-        );
-    }
-    loop {}
+    fei_agent_sandbox::exit_process(0)
 }

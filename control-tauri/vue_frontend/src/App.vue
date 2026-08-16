@@ -438,7 +438,7 @@ async function uploadFile() {
   try {
     const result = await invoke('upload_file', { 
       agentId: selectedAgent.value.id,
-      localPath: '', // 本地文件路径
+      localPath: prompt('本地文件路径:') || '', // 本地文件路径
       remotePath: currentPath.value 
     });
     console.log('文件上传结果:', result);
@@ -456,7 +456,7 @@ async function downloadFile() {
     const result = await invoke('download_file', { 
       agentId: selectedAgent.value.id,
       remotePath: `${currentPath.value}/${selectedFile.value.name}`,
-      localPath: '' // 本地保存路径
+      localPath: prompt('本地文件路径:') || '' // 本地保存路径
     });
     console.log('文件下载结果:', result);
   } catch (error) {

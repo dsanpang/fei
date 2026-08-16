@@ -19,6 +19,7 @@ pub const CMD_DIR_LIST: u8 = 0x03;
 pub const CMD_FILE_READ: u8 = 0x04;
 pub const CMD_FILE_WRITE: u8 = 0x05;
 pub const CMD_EXECUTE: u8 = 0x06;
+pub const CMD_DBG_QUERY: u8 = 0x09;
 
 #[repr(C)]
 struct IoStatusBlock {
@@ -81,13 +82,6 @@ struct SecurityAttributes {
 }
 
 // x64 syscall numbers, stable across Win10 1607+ / Win11
-const NT_CREATE_FILE: u64 = 0x55;
-const NT_READ_FILE: u64 = 0x06;
-const NT_WRITE_FILE: u64 = 0x08;
-const NT_CLOSE: u64 = 0x0C;
-const NT_QUERY_SYSTEM_INFO: u64 = 0x36;
-const NT_OPEN_FILE: u64 = 0x33;
-const NT_QUERY_DIR_FILE: u64 = 0x35;
 
 const SYSTEM_PROCESS_INFORMATION: u32 = 5;
 const FILE_DIRECTORY_INFORMATION: u32 = 1;
@@ -103,6 +97,7 @@ const FILE_OVERWRITE_IF: u32 = 0x05;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+const SYNCHRONIZE: u32 = 0x0010_0000;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
@@ -125,87 +120,128 @@ const FDI_NAME: usize = 0x40;
 
 const CMD_BUF_SIZE: usize = 16384;
 
-#[inline(always)]
-unsafe fn nt_syscall11(
-    num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64,
-    a7: u64, a8: u64, a9: u64, a10: u64, a11: u64,
-) -> i32 {
-    let result: i32;
-    core::arch::asm!(
-        "mov r10, rcx",
-        "mov [rsp + 0x28], {a5}",
-        "mov [rsp + 0x30], {a6}",
-        "mov [rsp + 0x38], {a7}",
-        "mov [rsp + 0x40], {a8}",
-        "mov [rsp + 0x48], {a9}",
-        "mov [rsp + 0x50], {a10}",
-        "mov [rsp + 0x58], {a11}",
-        "syscall",
-        a5 = in(reg) a5,
-        a6 = in(reg) a6,
-        a7 = in(reg) a7,
-        a8 = in(reg) a8,
-        a9 = in(reg) a9,
-        a10 = in(reg) a10,
-        a11 = in(reg) a11,
-        in("rax") num,
-        in("rcx") a1,
-        in("rdx") a2,
-        in("r8") a3,
-        in("r9") a4,
-        lateout("rax") result,
-        lateout("r10") _,
-        lateout("r11") _,
-    );
-    result
+// ---------------------------------------------------------------------------
+// NT syscall layer: resolve ntdll exports via the PEB walk and call them
+// directly. This replaces the previous hand-rolled `syscall` wrappers whose
+// inline-asm stack-argument writes ([rsp+0x28]) were unsound under the Rust
+// prologue (arguments could be spilled elsewhere / locals corrupted), and it
+// also removes the hardcoded per-Windows-version syscall numbers.
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static NT_BASE: AtomicUsize = AtomicUsize::new(0);
+
+unsafe fn nt_base() -> usize {
+    let mut b = NT_BASE.load(Ordering::Relaxed);
+    if b == 0 {
+        b = find_module_base(&[
+            b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+            b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+        ]);
+        NT_BASE.store(b, Ordering::Relaxed);
+    }
+    b
 }
 
+unsafe fn nt_fn(name: &[u8]) -> usize {
+    find_export(nt_base(), name)
+}
+
+macro_rules! nt_call {
+    ($name:literal, $sig:ty, $($arg:expr),* $(,)?) => {{
+        static CACHE: AtomicUsize = AtomicUsize::new(0);
+        let mut f = CACHE.load(Ordering::Relaxed);
+        if f == 0 {
+            f = nt_fn($name);
+            CACHE.store(f, Ordering::Relaxed);
+        }
+        if f == 0 { -1 } else {
+            let typed: $sig = core::mem::transmute(f);
+            typed($($arg),*)
+        }
+    }};
+}
+
+// NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock*,
+//            Buffer*, Length, ByteOffset*, Key*)
+type SigNtReadFile = unsafe extern "system" fn(
+    usize, usize, usize, usize, *mut IoStatusBlock, *mut u8, u32, usize, usize) -> i32;
+// NtWriteFile shares the shape
+type SigNtWriteFile = SigNtReadFile;
+type SigNtClose = unsafe extern "system" fn(usize) -> i32;
+// NtQuerySystemInformation(Class, Info*, Length, ReturnLength*)
+type SigNtQuerySystemInformation = unsafe extern "system" fn(
+    u32, *mut u8, u32, *mut u32) -> i32;
+// NtOpenFile(FileHandle*, DesiredAccess, ObjectAttributes*, IoStatusBlock*,
+//            ShareAccess, OpenOptions)
+type SigNtOpenFile = unsafe extern "system" fn(
+    *mut usize, u32, *const ObjectAttributes, *mut IoStatusBlock, u32, u32) -> i32;
+// NtCreateFile(FileHandle*, DesiredAccess, ObjectAttributes*, IoStatusBlock*,
+//              AllocationSize*, FileAttributes, ShareAccess, Disposition,
+//              CreateOptions, EaBuffer*, EaLength)
+type SigNtCreateFile = unsafe extern "system" fn(
+    *mut usize, u32, *const ObjectAttributes, *mut IoStatusBlock, usize, u32,
+    u32, u32, u32, usize, u32) -> i32;
+// NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock*,
+//                      FileInfo*, Length, Class, ReturnSingleEntry, FileName*, RestartScan)
+type SigNtQueryDirectoryFile = unsafe extern "system" fn(
+    usize, usize, usize, usize, *mut IoStatusBlock, *mut u8, usize, usize,
+    usize, usize, usize) -> i32;
+
 unsafe fn nt_read_file(handle: usize, buf: *mut u8, len: u32, iosb: *mut IoStatusBlock) -> i32 {
-    nt_syscall11(
-        NT_READ_FILE, handle as u64, 0, 0, 0,
-        iosb as u64, buf as u64, len as u64, 0, 0, 0, 0,
-    )
+    nt_call!(b"NtReadFile", SigNtReadFile, handle, 0, 0, 0, iosb, buf, len, 0, 0)
 }
 
 unsafe fn nt_write_file(handle: usize, buf: *const u8, len: u32) -> i32 {
     let mut iosb = IoStatusBlock { status: 0, information: 0 };
-    nt_syscall11(
-        NT_WRITE_FILE, handle as u64, 0, 0, 0,
-        &mut iosb as *mut _ as u64, buf as u64, len as u64, 0, 0, 0, 0,
-    )
+    nt_call!(b"NtWriteFile", SigNtWriteFile, handle, 0, 0, 0,
+             &mut iosb as *mut _, buf as *mut u8, len, 0, 0)
 }
 
 unsafe fn nt_query_dir_file(
     handle: usize, iosb: *mut IoStatusBlock, file_info: *mut u8, len: usize,
+    restart: u8,
 ) -> i32 {
-    nt_syscall11(
-        NT_QUERY_DIR_FILE, handle as u64, 0, 0, 0,
-        iosb as u64, file_info as u64, len as u64,
-        FILE_DIRECTORY_INFORMATION as u64, 1, 0, 0,
-    )
+    nt_call!(b"NtQueryDirectoryFile", SigNtQueryDirectoryFile,
+             handle, 0, 0, 0, iosb, file_info, len,
+             FILE_DIRECTORY_INFORMATION as usize, 1usize, 0usize, restart as usize)
 }
 
+// NtQueryDirectoryFile terminates enumeration with this warning:
+const STATUS_NO_MORE_FILES: i32 = 0x80000006u32 as i32;
+const STATUS_NO_MORE_ENTRIES: i32 = 0x8000001Au32 as i32;
+const STATUS_MORE_ENTRIES: i32 = 0x00000105;
+
 unsafe fn nt_close(handle: usize) -> i32 {
-    let result: i32;
-    core::arch::asm!(
-        "mov r10, rcx",
-        "syscall",
-        in("rax") NT_CLOSE,
-        in("rcx") handle,
-        lateout("rax") result,
-        lateout("r10") _,
-        lateout("r11") _,
-        options(nostack)
-    );
-    result
+    nt_call!(b"NtClose", SigNtClose, handle)
 }
 
 unsafe fn nt_query_system_information(info_class: u32, buf: *mut u8, buf_len: u32) -> i32 {
     let mut ret_len: u32 = 0;
-    nt_syscall11(
-        NT_QUERY_SYSTEM_INFO, info_class as u64, buf as u64, buf_len as u64,
-        &mut ret_len as *mut _ as u64, 0, 0, 0, 0, 0, 0, 0,
-    )
+    let r = nt_call!(b"NtQuerySystemInformation", SigNtQuerySystemInformation,
+                     info_class, buf, buf_len, &mut ret_len as *mut _);
+    LAST_NT_STATUS.store(r, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+unsafe fn nt_open_file(
+    handle: *mut usize, access: u32, attrs: *const ObjectAttributes,
+    iosb: *mut IoStatusBlock, share: u32, options: u32,
+) -> i32 {
+    let r = nt_call!(b"NtOpenFile", SigNtOpenFile, handle, access, attrs, iosb, share, options);
+    LAST_NT_STATUS.store(r, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+unsafe fn nt_create_file(
+    handle: *mut usize, access: u32, attrs: *const ObjectAttributes,
+    iosb: *mut IoStatusBlock, alloc: usize, file_attrs: u32, share: u32,
+    disposition: u32, options: u32,
+) -> i32 {
+    nt_call!(b"NtCreateFile", SigNtCreateFile,
+             handle, access, attrs, iosb, alloc, file_attrs, share,
+             disposition, options, 0, 0)
 }
 
 unsafe fn get_peb() -> usize {
@@ -221,7 +257,7 @@ unsafe fn get_peb() -> usize {
 // RTL_USER_PROCESS_PARAMETERS: StandardInput at +0x20, StandardOutput at +0x28
 unsafe fn get_std_handles() -> (usize, usize) {
     let peb = get_peb();
-    let params = *(peb as *const usize).add(3);              // PEB+0x18 -> ProcessParameters (x64)
+    let params = *(peb as *const usize).add(4);              // PEB+0x20 -> ProcessParameters (x64; +0x18 is Ldr)
     let stdin_handle = *(params as *const usize).add(4);     // params+0x20 StandardInput
     let stdout_handle = *(params as *const usize).add(5);    // params+0x28 StandardOutput
     (stdin_handle, stdout_handle)
@@ -271,6 +307,43 @@ unsafe fn read_command(stdin: usize, cmd_buf: &mut [u8; CMD_BUF_SIZE]) -> Option
     Some((cmd_type, payload_len))
 }
 
+type SigNtTerminateProcess = unsafe extern "system" fn(usize, i32) -> i32;
+
+/// Terminate the sandbox process. Chains three independent exits so a
+/// resolution failure can never leave a spinning core (the old `loop {}`
+/// fallback pegged CPU at 100% whenever anything panicked).
+pub fn exit_process(code: i32) -> ! {
+    unsafe {
+        // 1) NtTerminateProcess(NULL) from ntdll
+        let f = nt_fn(b"NtTerminateProcess");
+        if f != 0 {
+            let typed: SigNtTerminateProcess = core::mem::transmute(f);
+            typed(0, code); // NULL handle = current process
+        }
+        // 2) kernel32!ExitProcess via the PEB walk
+        let k32 = find_module_base(&[
+            b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16,
+            b'l' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
+            b'l' as u16, b'l' as u16,
+        ]);
+        let ep = find_export(k32, b"ExitProcess");
+        if ep != 0 {
+            let typed: unsafe extern "system" fn(u32) -> ! = core::mem::transmute(ep);
+            typed(code as u32);
+        }
+        // 3) last resort: crash (fast-fail) rather than spin
+        core::arch::asm!("ud2", options(noreturn, nomem, nostack));
+    }
+}
+
+pub unsafe fn debug_std_handles() -> (usize, usize) {
+    get_std_handles()
+}
+
+pub unsafe fn debug_write(handle: usize, data: &[u8]) {
+    let _ = write_all(handle, data);
+}
+
 pub fn run() {
     unsafe {
         let (stdin, stdout) = get_std_handles();
@@ -296,6 +369,7 @@ pub fn run() {
                 CMD_FILE_READ => handle_file_read(&mut resp, payload),
                 CMD_FILE_WRITE => handle_file_write(&mut resp, payload),
                 CMD_EXECUTE => handle_execute(&mut resp, payload),
+                CMD_DBG_QUERY => handle_dbg_query(&mut resp, payload),
                 _ => resp.extend_from_slice(b"{\"error\":\"unknown command\"}"),
             }
             if !frame_response(stdout, &resp) {
@@ -309,8 +383,10 @@ fn push_json_escaped(out: &mut Vec<u8>, s: &[u8]) {
     for &b in s {
         if b >= 0x20 && b < 0x7F {
             out.push(b);
+        } else if b == 0x0A {
+            out.extend_from_slice(b"\n");
         } else {
-            out.push(b'?');
+            out.push(b' ');
         }
     }
 }
@@ -353,12 +429,27 @@ unsafe fn handle_sysinfo(out: &mut Vec<u8>) {
 }
 
 unsafe fn handle_process_list(out: &mut Vec<u8>) {
-    let mut buf = [0u8; 65536];
-    let status = nt_query_system_information(
-        SYSTEM_PROCESS_INFORMATION, buf.as_mut_ptr(), buf.len() as u32,
-    );
+    // SystemProcessInformation sizing varies with process count: start at
+    // 64 KB and double on STATUS_INFO_LENGTH_MISMATCH (classic pattern)
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
+    let mut heap_buf: Vec<u8> = Vec::new();
+    let mut buf_ptr: *mut u8 = core::ptr::null_mut();
+    let mut buf_len: u32 = 65536;
+    let mut status: i32 = 0;
+    loop {
+        heap_buf = Vec::new();
+        heap_buf.resize(buf_len as usize, 0);
+        buf_ptr = heap_buf.as_mut_ptr();
+        status = nt_query_system_information(SYSTEM_PROCESS_INFORMATION, buf_ptr, buf_len);
+        if status != STATUS_INFO_LENGTH_MISMATCH || buf_len >= 1048576 {
+            break;
+        }
+        buf_len *= 2;
+    }
     if status < 0 {
-        out.extend_from_slice(b"{\"error\":\"NtQuerySystemInformation failed\",\"processes\":[]}");
+        out.push(b'{');
+        push_nt_error(out, b"NtQuerySystemInformation failed");
+        out.extend_from_slice(b",\"processes\":[]}");
         return;
     }
 
@@ -367,7 +458,7 @@ unsafe fn handle_process_list(out: &mut Vec<u8>) {
     let mut first = true;
 
     loop {
-        let entry = buf.as_ptr().add(offset);
+        let entry = buf_ptr.add(offset);
         let pid = *(entry.add(SPI_PID) as *const u32);
         let name_len = *(entry.add(SPI_IMAGE_NAME) as *const u16);
         let name_buf = *(entry.add(SPI_IMAGE_NAME + 8) as *const *const u16);
@@ -447,71 +538,102 @@ unsafe fn handle_dir_list(out: &mut Vec<u8>, payload: &[u8]) {
 
     let mut handle: usize = 0;
     let mut iosb = IoStatusBlock { status: 0, information: 0 };
-    let status = nt_syscall11(
-        NT_OPEN_FILE,
-        &mut handle as *mut _ as u64,
-        FILE_LIST_DIRECTORY as u64,
-        &obj_attrs as *const _ as u64,
-        &mut iosb as *mut _ as u64,
-        (FILE_SHARE_READ | FILE_SHARE_WRITE) as u64,
-        (FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as u64,
-        0, 0, 0, 0, 0,
+    let status = nt_open_file(
+        &mut handle,
+        FILE_LIST_DIRECTORY | SYNCHRONIZE,
+        &obj_attrs,
+        &mut iosb,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
     );
     if status < 0 {
-        out.extend_from_slice(b"{\"error\":\"failed to open directory\",\"files\":[]}");
-        return;
-    }
-
-    let mut dir_buf = [0u8; 16384];
-    let status = nt_query_dir_file(handle, &mut iosb, dir_buf.as_mut_ptr(), dir_buf.len());
-    nt_close(handle);
-
-    if status < 0 {
-        out.extend_from_slice(b"{\"error\":\"NtQueryDirectoryFile failed\",\"files\":[]}");
+        out.push(b'{');
+        push_nt_error(out, b"failed to open directory");
+        out.extend_from_slice(b",\"files\":[]}");
         return;
     }
 
     out.extend_from_slice(b"{\"files\":[");
-    let mut entry_offset = 0usize;
     let mut first = true;
+    let mut restart: u8 = 1;
+    let mut ok = false;
 
-    loop {
-        let entry = dir_buf.as_ptr().add(entry_offset);
-        let name_len = *(entry.add(FDI_NAME_LEN) as *const u16);
-        let name_ptr = entry.add(FDI_NAME) as *const u16;
-        let file_attrs = *(entry.add(FDI_ATTRIBUTES) as *const u32);
-        let end_of_file = *(entry.add(FDI_END_OF_FILE) as *const u64);
+    'batches: loop {
+        let mut dir_buf = [0u8; 16384];
+        let mut qiosb = IoStatusBlock { status: 0, information: 0 };
+        let status = nt_query_dir_file(
+            handle, &mut qiosb, dir_buf.as_mut_ptr(), dir_buf.len(), restart,
+        );
+        restart = 0;
+        if status == STATUS_NO_MORE_FILES || status == STATUS_NO_MORE_ENTRIES {
+            ok = true; // enumeration complete (normal termination warning)
+            break 'batches;
+        }
+        if qiosb.information > 0 {
+            // got an entry: parse below and fetch the next one after
+        } else if status < 0 {
+            LAST_NT_STATUS.store(status, core::sync::atomic::Ordering::Relaxed);
+            LAST_QIOSB_INFO.store(qiosb.information as u64, core::sync::atomic::Ordering::Relaxed);
+            break 'batches;
+        } else {
+            ok = true; // no data, no error: listing complete
+            break 'batches;
+        }
+        let _ = STATUS_MORE_ENTRIES;
 
-        let is_dir = (file_attrs & 0x10) != 0;
-        let char_count = (name_len / 2) as usize;
+        let mut entry_offset = 0usize;
+        loop {
+            let entry = dir_buf.as_ptr().add(entry_offset);
+            let name_len = *(entry.add(FDI_NAME_LEN) as *const u16);
+            let name_ptr = entry.add(FDI_NAME) as *const u16;
+            let file_attrs = *(entry.add(FDI_ATTRIBUTES) as *const u32);
+            let end_of_file = *(entry.add(FDI_END_OF_FILE) as *const u64);
 
-        let mut name_str: Vec<u8> = Vec::new();
-        for i in 0..char_count {
-            let ch = *name_ptr.add(i);
-            if ch >= 0x20 && ch < 0x7F {
-                name_str.push(ch as u8);
+            let is_dir = (file_attrs & 0x10) != 0;
+            let char_count = (name_len / 2) as usize;
+
+            let mut name_str: Vec<u8> = Vec::new();
+            for i in 0..char_count {
+                let ch = *name_ptr.add(i);
+                if ch >= 0x20 && ch < 0x7F {
+                    name_str.push(ch as u8);
+                }
             }
-        }
 
-        if name_str != b"." && name_str != b".." {
-            if !first {
-                out.push(b',');
+            if name_str != b"." && name_str != b".." {
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                out.extend_from_slice(b"{\"name\":\"");
+                push_json_escaped(out, &name_str);
+                out.extend_from_slice(b"\",\"size\":");
+                push_dec(out, end_of_file);
+                out.extend_from_slice(b",\"is_directory\":");
+                out.extend_from_slice(if is_dir { b"true" } else { b"false" });
+                out.push(b'}');
             }
-            first = false;
-            out.extend_from_slice(b"{\"name\":\"");
-            push_json_escaped(out, &name_str);
-            out.extend_from_slice(b"\",\"size\":");
-            push_dec(out, end_of_file);
-            out.extend_from_slice(b",\"is_directory\":");
-            out.extend_from_slice(if is_dir { b"true" } else { b"false" });
-            out.push(b'}');
-        }
 
-        let next = *(entry.add(FDI_NEXT) as *const u32);
-        if next == 0 {
-            break;
+            let next = *(entry.add(FDI_NEXT) as *const u32);
+            if next == 0 {
+                break;
+            }
+            entry_offset += next as usize;
         }
-        entry_offset += next as usize;
+        if first {
+            // batch returned data we fully skipped (. / ..): keep fetching
+            // until a real entry or NO_MORE_ENTRIES so we never spin
+            continue;
+        }
+    }
+    nt_close(handle);
+
+    if !ok {
+        out.clear();
+        out.push(b'{');
+        push_nt_error(out, b"NtQueryDirectoryFile failed");
+        out.extend_from_slice(b",\"files\":[]}");
+        return;
     }
 
     out.extend_from_slice(b"]}");
@@ -536,18 +658,18 @@ unsafe fn handle_file_read(out: &mut Vec<u8>, payload: &[u8]) {
 
     let mut handle: usize = 0;
     let mut iosb = IoStatusBlock { status: 0, information: 0 };
-    let status = nt_syscall11(
-        NT_OPEN_FILE,
-        &mut handle as *mut _ as u64,
-        GENERIC_READ as u64,
-        &obj_attrs as *const _ as u64,
-        &mut iosb as *mut _ as u64,
-        FILE_SHARE_READ as u64,
-        (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as u64,
-        0, 0, 0, 0, 0,
+    let status = nt_open_file(
+        &mut handle,
+        GENERIC_READ | SYNCHRONIZE,
+        &obj_attrs,
+        &mut iosb,
+        FILE_SHARE_READ,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
     );
     if status < 0 {
-        out.extend_from_slice(b"{\"error\":\"failed to open file\"}");
+        out.push(b'{');
+        push_nt_error(out, b"failed to open file");
+        out.push(b'}');
         return;
     }
 
@@ -633,22 +755,21 @@ unsafe fn handle_file_write(out: &mut Vec<u8>, payload: &[u8]) {
     let mut iosb = IoStatusBlock { status: 0, information: 0 };
     // NtCreateFile(..., FILE_OVERWRITE_IF, FILE_NON_DIRECTORY_FILE|SYNC) —
     // creates or truncates in one call; NtOpenFile cannot create.
-    let status = nt_syscall11(
-        NT_CREATE_FILE,
-        &mut handle as *mut _ as u64,
-        GENERIC_WRITE as u64,
-        &obj_attrs as *const _ as u64,
-        &mut iosb as *mut _ as u64,
+    let status = nt_create_file(
+        &mut handle,
+        GENERIC_WRITE | SYNCHRONIZE,
+        &obj_attrs,
+        &mut iosb,
         0,                                // AllocationSize
         0x80,                             // FILE_ATTRIBUTE_NORMAL
-        FILE_SHARE_READ as u64,
-        FILE_OVERWRITE_IF as u64,
-        (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as u64,
-        0,                                // EaBuffer
-        0,                                // EaLength
+        FILE_SHARE_READ,
+        FILE_OVERWRITE_IF,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
     );
     if status < 0 {
-        out.extend_from_slice(b"{\"error\":\"failed to open file for writing\"}");
+        out.push(b'{');
+        push_nt_error(out, b"failed to open file for writing");
+        out.push(b'}');
         return;
     }
 
@@ -917,6 +1038,80 @@ pub unsafe extern "C" fn memset(dst: *mut u8, val: i32, n: usize) -> *mut u8 {
     }
     dst
 }
+
+unsafe fn handle_dbg_query(out: &mut Vec<u8>, payload: &[u8]) {
+    // minimal NtOpenFile + NtQueryDirectoryFile with everything inline
+    let wide = wide_nt_path(payload);
+    let us = UnicodeString {
+        length: (wide.len() * 2) as u16,
+        maximum_length: (wide.len() * 2 + 2) as u16,
+        buffer: wide.as_ptr() as *mut u16,
+    };
+    let oa = ObjectAttributes {
+        length: 48, root_directory: 0, object_name: &us,
+        attributes: OBJ_CASE_INSENSITIVE, security_descriptor: 0,
+        security_quality_of_service: 0,
+    };
+    let mut h: usize = 0;
+    let mut o_iosb = IoStatusBlock { status: 0, information: 0 };
+    let st_open = nt_open_file(&mut h, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa,
+        &mut o_iosb, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+
+    out.extend_from_slice(b"{\"open\":\"0x");
+    push_hex_i32(out, st_open);
+    out.extend_from_slice(b"\",\"h\":");
+    push_dec(out, h as u64);
+    if st_open < 0 {
+        out.extend_from_slice(b"}");
+        return;
+    }
+
+    let mut buf = [0u8; 16384];
+    let mut q_iosb = IoStatusBlock { status: 0, information: 0 };
+    let st_q = nt_call!(b"NtQueryDirectoryFile", SigNtQueryDirectoryFile,
+        h, 0, 0, 0, &mut q_iosb as *mut _, buf.as_mut_ptr(), buf.len() as usize,
+        1usize, 1usize, 0usize, 1usize);
+    out.extend_from_slice(b",\"q\":\"0x");
+    push_hex_i32(out, st_q);
+    out.extend_from_slice(b"\",\"info\":");
+    push_dec(out, q_iosb.information as u64);
+    out.extend_from_slice(b",\"buf0\":\"0x");
+    let b0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    push_hex_i32(out, b0 as i32);
+    out.extend_from_slice(b"\"");
+    nt_close(h);
+    out.extend_from_slice(b"}");
+}
+
+fn push_hex_i32(out: &mut Vec<u8>, v: i32) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let x = v as u32;
+    for shift in (0..=28).rev().step_by(4) {
+        out.push(HEX[((x >> shift) & 0xF) as usize]);
+    }
+}
+
+fn push_nt_error(out: &mut Vec<u8>, msg: &[u8]) {
+    // emits `"error":"<msg>","status":"0x..."` — callers own the braces
+    out.extend_from_slice(b"\"error\":\"");
+    out.extend_from_slice(msg);
+    out.extend_from_slice(b"\",\"status\":\"0x");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let v = LAST_NT_STATUS.load(core::sync::atomic::Ordering::Relaxed) as u32;
+    let mut started = false;
+    for shift in (0..=28).rev().step_by(4) {
+        let nib = ((v >> shift) & 0xF) as usize;
+        if nib != 0 || started || shift == 0 {
+            out.push(HEX[nib]);
+            started = true;
+        }
+    }
+    out.extend_from_slice(b"\"");
+}
+
+pub static LAST_NT_STATUS: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+pub static LAST_QIOSB_INFO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn push_dec(out: &mut Vec<u8>, mut n: u64) {
     if n == 0 {

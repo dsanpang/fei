@@ -18,6 +18,7 @@ fn main() {
             fei_control_core::commands::install_plugin,
             fei_control_core::commands::uninstall_plugin,
             fei_control_core::commands::generate_agent,
+            fei_control_core::commands::get_task,
             fei_control_core::credential_store::save_credentials,
             fei_control_core::credential_store::load_credentials,
             fei_control_core::credential_store::delete_credentials,

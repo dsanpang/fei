@@ -23,6 +23,9 @@ type AgentSession struct {
 	Conn          net.Conn
 	LastSeen      time.Time
 	SeqIn         uint32
+	RxSeq         uint32 // highest sequence accepted from the agent
+	HaveRxSeq     bool
+	TxSeq         uint32 // gateway-originated frames use their own counter
 	Hostname      string
 	IPAddress     string
 	OsInfo        string
@@ -211,9 +214,9 @@ func (gw *Gateway) handleConn(conn net.Conn) {
 	log.Printf("agent registered: %s from %s (hostname=%s, ip=%s)", agentIDHex, addr, hostname, ipAddress)
 
 	subj := fmt.Sprintf("fei.cmd.%s", agentIDHex)
+	// handleCommandFromControlPlane takes session.mu itself; locking here
+	// too deadlocked every command delivery (Go mutexes are not reentrant)
 	sub, err := gw.nc.Subscribe(subj, func(msg *nats.Msg) {
-		session.mu.Lock()
-		defer session.mu.Unlock()
 		gw.handleCommandFromControlPlane(session, msg.Data)
 	})
 	if err != nil {
@@ -239,6 +242,21 @@ func (gw *Gateway) handleConn(conn net.Conn) {
 			}
 			break
 		}
+
+		// anti-replay: agent frames must have strictly increasing sequence
+		// numbers within a session (replayed captures are dropped)
+		session.mu.Lock()
+		replayed := session.HaveRxSeq && frame.Header.Seq <= session.RxSeq
+		if !replayed {
+			session.RxSeq = frame.Header.Seq
+			session.HaveRxSeq = true
+		}
+		session.mu.Unlock()
+		if replayed {
+			log.Printf("[%s] replay detected: seq=%d <= %d, dropping frame",
+				agentIDHex, frame.Header.Seq, session.RxSeq)
+			continue
+		}
 		session.mu.Lock()
 		session.LastSeen = time.Now()
 		session.SeqIn = frame.Header.Seq
@@ -257,8 +275,8 @@ func (gw *Gateway) processFrame(session *AgentSession, frame *protocol.Frame, ag
 	switch frame.Header.Type {
 	case protocol.TypeHeartbeat:
 		session.mu.Lock()
-		ackSeq := session.SeqIn + 1
-		session.SeqIn = ackSeq
+		session.TxSeq++
+		ackSeq := session.TxSeq
 		err := protocol.WriteEncryptedFrame(session.Conn, gw.psk, protocol.TypeHeartbeat, ackSeq, session.AgentID, []byte("ack"))
 		session.mu.Unlock()
 		if err != nil {
@@ -326,8 +344,8 @@ func (gw *Gateway) handleCommandFromControlPlane(session *AgentSession, data []b
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	seq := session.SeqIn + 1
-	session.SeqIn = seq
+	session.TxSeq++
+	seq := session.TxSeq
 	if cmd.TaskID != "" {
 		session.pendingTasks = append(session.pendingTasks, cmd.TaskID)
 	}
