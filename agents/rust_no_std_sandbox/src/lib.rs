@@ -195,10 +195,9 @@ unsafe fn nt_read_file(handle: usize, buf: *mut u8, len: u32, iosb: *mut IoStatu
     nt_call!(b"NtReadFile", SigNtReadFile, handle, 0, 0, 0, iosb, buf, len, 0, 0)
 }
 
-unsafe fn nt_write_file(handle: usize, buf: *const u8, len: u32) -> i32 {
-    let mut iosb = IoStatusBlock { status: 0, information: 0 };
+unsafe fn nt_write_file(handle: usize, buf: *const u8, len: u32, iosb: *mut IoStatusBlock) -> i32 {
     nt_call!(b"NtWriteFile", SigNtWriteFile, handle, 0, 0, 0,
-             &mut iosb as *mut _, buf as *mut u8, len, 0, 0)
+             iosb, buf as *mut u8, len, 0, 0)
 }
 
 unsafe fn nt_query_dir_file(
@@ -284,7 +283,25 @@ unsafe fn read_exact(handle: usize, buf: *mut u8, len: usize) -> bool {
 }
 
 unsafe fn write_all(handle: usize, data: &[u8]) -> bool {
-    nt_write_file(handle, data.as_ptr(), data.len() as u32) >= 0
+    // A pipe NtWriteFile is a SHORT write whenever the request exceeds the
+    // pipe buffer: it returns success with iosb.information = bytes actually
+    // written. Loop until the whole response is in the pipe; the old
+    // single-call version silently truncated every large response and left
+    // the desynced bytes to poison all later commands.
+    let mut off = 0usize;
+    while off < data.len() {
+        let mut iosb = IoStatusBlock { status: 0, information: 0 };
+        let status = nt_write_file(handle, data.as_ptr().add(off),
+                                   (data.len() - off) as u32, &mut iosb);
+        if status < 0 {
+            return false;
+        }
+        if iosb.information == 0 {
+            return false;
+        }
+        off += iosb.information;
+    }
+    true
 }
 
 // frame_response: single write of [len u32 LE][data]

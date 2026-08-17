@@ -293,6 +293,7 @@ func (cp *ControlPlane) handleEvent(msg *nats.Msg) {
 
 	case "exception":
 		log.Printf("agent exception: %s - %v", agentID, evt["payload"])
+		cp.failPendingTask(agentID, evt)
 
 	case "plugin_load":
 		log.Printf("plugin load ack: %s", agentID)
@@ -367,6 +368,41 @@ func (cp *ControlPlane) handleExecReturn(agentID string, evt map[string]any) boo
 	}
 
 	return false
+}
+
+// failPendingTask marks the most recently sent, still-pending task for the
+// agent as failed when an exception frame arrives. Exception frames carry no
+// task correlation, so "newest pending" is the same heuristic handleExecReturn
+// uses; without this the task would sit in "sent" until the 60 s timeout even
+// though the agent answered immediately with an error.
+func (cp *ControlPlane) failPendingTask(agentID string, evt map[string]any) {
+	var matched *Task
+	cp.tasks.Range(func(key, value any) bool {
+		task := value.(*Task)
+		if task.AgentID == agentID && task.Status == TaskSent {
+			if matched == nil || task.Updated.After(matched.Updated) {
+				matched = task
+			}
+		}
+		return true
+	})
+	if matched == nil {
+		return
+	}
+	reason := "agent exception"
+	if raw, ok := evt["payload"]; ok {
+		switch v := raw.(type) {
+		case string:
+			reason = "agent exception: " + string(decodeTaskResult([]byte(v)))
+		case []byte:
+			reason = "agent exception: " + string(decodeTaskResult(v))
+		}
+	}
+	matched.Status = TaskFailed
+	matched.ErrReason = reason
+	matched.Updated = time.Now()
+	cp.markDirty()
+	log.Printf("task %s failed for agent %s (%s)", matched.ID, agentID, reason)
 }
 
 func (cp *ControlPlane) handleAPIRequest(msg *nats.Msg) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/binary"
 	"encoding/json"
@@ -155,6 +156,17 @@ func (s *GRPCServer) SendCommand(ctx context.Context, req *pb.SendCommandRequest
 		payload = sandboxFrame(0x06, []byte(strings.Join(append([]string{req.Command}, req.Parameters...), " ")))
 	}
 
+	// The agent drops command frames larger than its 16KB staging budget
+	// (with an exception report). Stop here with a clear error instead of
+	// shipping a doomed frame.
+	const agentFrameBudget = 16384
+	if len(payload) > agentFrameBudget {
+		return &pb.SendCommandResponse{
+			Success: false,
+			Error:   fmt.Sprintf("payload %d bytes exceeds agent frame budget %d; use chunked upload/download", len(payload), agentFrameBudget),
+		}, nil
+	}
+
 	taskID, err := s.forwardCommandToAgent(req.AgentId, cmdType, payload)
 	if err != nil {
 		return &pb.SendCommandResponse{Success: false, Error: err.Error()}, nil
@@ -165,7 +177,7 @@ func (s *GRPCServer) SendCommand(ctx context.Context, req *pb.SendCommandRequest
 		return &pb.SendCommandResponse{
 			Success: true,
 			TaskId:  taskID,
-			Result:  string(task.Result),
+			Result:  string(decodeTaskResult(task.Result)),
 		}, nil
 	}
 
@@ -197,6 +209,18 @@ func (s *GRPCServer) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoReq
 			State:     uint32(agent.State),
 		},
 	}, nil
+}
+
+// decodeTaskResult unwraps the base64 layer the NATS JSON transport adds to
+// []byte payloads (json.Marshal encodes []byte as base64, so task.Result
+// arrives as base64 text). Sandbox responses are JSON starting with '{',
+// which is never valid base64 — decode failure means the value is already
+// raw and is returned unchanged.
+func decodeTaskResult(raw []byte) []byte {
+	if dec, err := base64.StdEncoding.DecodeString(string(raw)); err == nil {
+		return dec
+	}
+	return raw
 }
 
 func (s *GRPCServer) forwardCommandToAgent(agentID string, cmdType uint16, payload []byte) (string, error) {
@@ -353,7 +377,7 @@ func (s *GRPCServer) UploadFile(ctx context.Context, req *pb.UploadFileRequest) 
 		return &pb.UploadFileResponse{Success: false, Error: err.Error()}, nil
 	}
 
-	const chunkBytes = 900 // per-command budget verified reliable end-to-end; 3KB+ frames hit an agent receive boundary (see README known issues)
+	const chunkBytes = 7000 // 14000 hex chars + path well under the 16KB agent frame cap (per-frame pipe writes fixed; see DEBUG_NOTES_3KB_BOUNDARY.md)
 	total := len(content)
 	for off, i := 0, 0; off < total; off += chunkBytes {
 		end := off + chunkBytes
@@ -429,7 +453,7 @@ func (s *GRPCServer) DownloadFile(ctx context.Context, req *pb.DownloadFileReque
 		ContentHex string `json:"content_hex"`
 		Error      string `json:"error"`
 	}
-	if err := json.Unmarshal(task.Result, &parsed); err != nil {
+	if err := json.Unmarshal(decodeTaskResult(task.Result), &parsed); err != nil {
 		return &pb.DownloadFileResponse{Success: false, Error: err.Error()}, nil
 	}
 	if parsed.Error != "" {
