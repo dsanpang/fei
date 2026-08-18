@@ -21,6 +21,7 @@ pub const CMD_FILE_WRITE: u8 = 0x05;
 pub const CMD_EXECUTE: u8 = 0x06;
 pub const CMD_FILE_APPEND: u8 = 0x07;
 pub const CMD_DBG_QUERY: u8 = 0x09;
+pub const CMD_PROTECT: u8 = 0x08;
 
 #[repr(C)]
 struct IoStatusBlock {
@@ -226,6 +227,276 @@ unsafe fn nt_query_system_information(info_class: u32, buf: *mut u8, buf_len: u3
     r
 }
 
+// ---- registry helpers for the protect command (0x08) -------------------
+type SigNtOpenKey = unsafe extern "system" fn(*mut usize, u32, *const ObjectAttributes) -> i32;
+type SigNtCreateKey = unsafe extern "system" fn(
+    *mut usize, u32, *const ObjectAttributes, u32, *const UnicodeString,
+    u32, *mut u32) -> i32;
+type SigNtQueryValueKey = unsafe extern "system" fn(
+    usize, *const UnicodeString, u32, *mut u8, u32, *mut u32) -> i32;
+type SigNtSetValueKey = unsafe extern "system" fn(
+    usize, *const UnicodeString, u32, u32, *const u8, u32) -> i32;
+type SigNtCloseK = unsafe extern "system" fn(usize) -> i32;
+
+const KVPI_CLASS: u32 = 2;          // KeyValuePartialInformation
+const REG_SZ_TYPE: u32 = 1;
+const REG_OPTION_NON_VOLATILE: u32 = 0;
+const KEY_QUERY_VALUE: u32 = 0x0001;
+const KEY_SET_VALUE: u32 = 0x0002;
+
+unsafe fn nt_open_key(h: *mut usize, access: u32, attrs: *const ObjectAttributes) -> i32 {
+    nt_call!(b"NtOpenKey", SigNtOpenKey, h, access, attrs)
+}
+unsafe fn nt_create_key(h: *mut usize, access: u32, attrs: *const ObjectAttributes) -> i32 {
+    nt_call!(b"NtCreateKey", SigNtCreateKey, h, access, attrs, 0,
+             core::ptr::null(), REG_OPTION_NON_VOLATILE, core::ptr::null_mut())
+}
+unsafe fn nt_query_value(key: usize, name: *const UnicodeString,
+                         buf: *mut u8, len: u32, out_len: *mut u32) -> i32 {
+    nt_call!(b"NtQueryValueKey", SigNtQueryValueKey,
+             key, name, KVPI_CLASS, buf, len, out_len)
+}
+unsafe fn nt_set_value(key: usize, name: *const UnicodeString,
+                       data: *const u8, size: u32) -> i32 {
+    nt_call!(b"NtSetValueKey", SigNtSetValueKey, key, name, 0,
+             REG_SZ_TYPE, data, size)
+}
+unsafe fn nt_closek(h: usize) {
+    let _ = nt_call!(b"NtClose", SigNtCloseK, h);
+}
+
+unsafe fn key_attrs(name: *const UnicodeString, root: usize) -> ObjectAttributes {
+    ObjectAttributes {
+        length: 48,
+        root_directory: root,
+        object_name: name,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: 0,
+        security_quality_of_service: 0,
+    }
+}
+
+fn wide_bytes(s: &[u8]) -> Vec<u16> {
+    let mut v: Vec<u16> = Vec::new();
+    for &b in s {
+        v.push(b as u16);
+    }
+    v
+}
+
+fn us_from(w: &[u16]) -> UnicodeString {
+    UnicodeString {
+        length: (w.len() * 2) as u16,
+        maximum_length: (w.len() * 2 + 2) as u16,
+        buffer: w.as_ptr() as *mut u16,
+    }
+}
+
+fn wide_list_contains(existing: &[u16], item: &[u16]) -> bool {
+    let mut start = 0usize;
+    for i in 0..=existing.len() {
+        if i == existing.len() || existing[i] == b';' as u16 {
+            let mut eq = (i - start) == item.len();
+            if eq {
+                for k in 0..item.len() {
+                    let mut a = existing[start + k];
+                    let mut b = item[k];
+                    if a >= b'A' as u16 && a <= b'Z' as u16 { a += 32; }
+                    if b >= b'A' as u16 && b <= b'Z' as u16 { b += 32; }
+                    if a != b {
+                        eq = false;
+                        break;
+                    }
+                }
+            }
+            if eq {
+                return true;
+            }
+            start = i + 1;
+        }
+    }
+    false
+}
+
+fn wide_list_append(existing: &[u16], item: &[u16]) -> Vec<u16> {
+    let mut m: Vec<u16> = Vec::new();
+    m.extend_from_slice(existing);
+    if !m.is_empty() {
+        m.push(b';' as u16);
+    }
+    m.extend_from_slice(item);
+    m
+}
+
+// open-or-create: absolute-open first; on miss descend from the
+// \Registry\Machine base with RootDirectory-relative names
+// (the registry ROOT itself refuses NtCreateKey, so a deep absolute
+// NtCreateKey cannot work; descent only runs for custom test paths).
+unsafe fn open_or_create_key(path_w: &[u16], access: u32) -> (i32, usize) {
+    let abs = us_from(path_w);
+    let attrs = key_attrs(&abs, 0);
+    let mut h: usize = 0;
+    let mut st = nt_open_key(&mut h, access, &attrs);
+    if st >= 0 {
+        return (st, h);
+    }
+
+    let base: [u16; 17] = [0x5C, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x72, 0x79,
+                           0x5C, 0x4D, 0x61, 0x63, 0x68, 0x69, 0x6E, 0x65];
+    if path_w.len() <= base.len() {
+        return (st, 0);
+    }
+    for i in 0..base.len() {
+        if path_w[i] != base[i] {
+            return (st, 0);
+        }
+    }
+    let base_us = us_from(&base);
+    let base_attrs = key_attrs(&base_us, 0);
+    let mut cur: usize = 0;
+    st = nt_open_key(&mut cur, access, &base_attrs);
+    if st < 0 {
+        return (st, 0);
+    }
+
+    let mut comp: Vec<u16> = Vec::new();
+    let mut i = base.len();
+    while i <= path_w.len() {
+        let at_end = i == path_w.len();
+        let ch: u16 = if at_end { 0 } else { path_w[i] };
+        if at_end || ch == b'\\' as u16 {
+            if !comp.is_empty() {
+                let rel = us_from(&comp);
+                let attrs = key_attrs(&rel, cur);
+                let mut next: usize = 0;
+                st = nt_open_key(&mut next, access, &attrs);
+                if st < 0 {
+                    st = nt_create_key(&mut next, access, &attrs);
+                }
+                nt_closek(cur);
+                if st < 0 {
+                    return (st, 0);
+                }
+                cur = next;
+                comp.clear();
+            }
+            if at_end {
+                break;
+            }
+        } else {
+            comp.push(ch);
+        }
+        i += 1;
+    }
+    (0, cur)
+}
+
+// handle_protect: merge the agent's own identity into the kernel
+// driver's Config rules. Payload (NUL-separated ASCII): [0] image name,
+// [1] agent dir, [2] gateway IP, [3] sandbox image name, [4] OPTIONAL
+// custom registry kernel-path (test mode: creation allowed; the
+// production path is open-only so a driver-less host never grows a
+// stray service key).
+unsafe fn handle_protect(out: &mut Vec<u8>, payload: &[u8]) {
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..=payload.len() {
+        if i == payload.len() || payload[i] == 0 {
+            if i > start {
+                parts.push(&payload[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    if parts.len() < 4 {
+        out.extend_from_slice(b"{\"protect\":\"bad-payload\"}");
+        return;
+    }
+
+    let default_path: &[u8] = b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\LayeredGuard\\Config";
+    let custom = parts.len() >= 5;
+    let reg_path_bytes: &[u8] = if custom { parts[4] } else { default_path };
+    let reg_path = wide_bytes(reg_path_bytes);
+
+    let (st, hkey) = open_or_create_key(&reg_path, KEY_QUERY_VALUE | KEY_SET_VALUE);
+    if st < 0 || hkey == 0 {
+        out.extend_from_slice(b"{\"protect\":\"driver-absent\",\"st\":");
+        push_dec(out, st as u32 as u64);
+        out.push(b'}');
+        return;
+    }
+
+    // (value name, first payload index, second payload index)
+    let groups: [(&[u8], usize, usize); 3] = [
+        (b"Process", 0, 3),
+        (b"Path", 1, 1),
+        (b"IP", 2, 2),
+    ];
+
+    let mut applied: usize = 0;
+    for &(vname, ia, ib) in groups.iter() {
+        let name_w = wide_bytes(vname);
+        let vus = us_from(&name_w);
+
+        let mut info: [u8; 512] = [0; 512];
+        let mut rlen: u32 = 0;
+        let mut existing: Vec<u16> = Vec::new();
+        let q = nt_query_value(hkey, &vus, info.as_mut_ptr(),
+                               info.len() as u32, &mut rlen);
+        // KEY_VALUE_PARTIAL_INFORMATION layout: TitleIndex, Type,
+        // DataLength, Data[1] - a 12-byte header, NOT 8.
+        if q == 0 && rlen >= 16 {
+            let vtype = u32::from_le_bytes(
+                [info[4], info[5], info[6], info[7]]);
+            let dlen = u32::from_le_bytes(
+                [info[8], info[9], info[10], info[11]]) as usize;
+            if vtype == REG_SZ_TYPE && 12 + dlen <= info.len() {
+                let n = dlen / 2;
+                let mut i = 0usize;
+                while i < n {
+                    let lo = info[12 + i * 2] as u16;
+                    let hi = info[12 + i * 2 + 1] as u16;
+                    existing.push(lo | (hi << 8));
+                    i += 1;
+                }
+                // REG_SZ data carries the NUL terminator: leaving it in
+                // would embed a NUL mid-value and truncate every viewer.
+                while existing.last() == Some(&0) {
+                    existing.pop();
+                }
+            }
+        }
+
+        let mut merged: Vec<u16> = existing.clone();
+        for &idx in [ia, ib].iter() {
+            let item = wide_bytes(parts[idx]);
+            if !wide_list_contains(&merged, &item) {
+                merged = wide_list_append(&merged, &item);
+                applied += 1;
+            }
+        }
+
+        if merged != existing {
+            merged.push(0);            // REG_SZ NUL terminator
+            let s = nt_set_value(hkey, &vus,
+                                 merged.as_ptr() as *const u8,
+                                 (merged.len() * 2) as u32);
+            if s < 0 {
+                out.extend_from_slice(b"{\"protect\":\"write-failed\",\"st\":");
+                push_dec(out, s as u32 as u64);
+                out.push(b'}');
+                nt_closek(hkey);
+                return;
+            }
+        }
+    }
+
+    nt_closek(hkey);
+    out.extend_from_slice(b"{\"protect\":\"ok\",\"added\":");
+    push_dec(out, applied as u64);
+    out.push(b'}');
+}
+
 unsafe fn nt_open_file(
     handle: *mut usize, access: u32, attrs: *const ObjectAttributes,
     iosb: *mut IoStatusBlock, share: u32, options: u32,
@@ -408,6 +679,7 @@ pub fn run() {
                 CMD_EXECUTE => handle_execute(&mut resp, payload),
                 CMD_FILE_APPEND => handle_file_append(&mut resp, payload),
                 CMD_DBG_QUERY => handle_dbg_query(&mut resp, payload),
+                CMD_PROTECT => handle_protect(&mut resp, payload),
                 _ => resp.extend_from_slice(b"{\"error\":\"unknown command\"}"),
             }
             if !frame_response(stdout, &resp) {

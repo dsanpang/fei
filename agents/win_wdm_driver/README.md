@@ -59,6 +59,28 @@ other value changes never touch spoofed PIDs.
   `FltDoCompletionProcessingWhenSafe`
 - `.` / `..` skipped by content **and** length together
 
+
+## C2 integration (automatic)
+
+The Fei userland agent merges its own identity into the Config rules
+at startup (and after every sandbox respawn) through sandbox command
+0x08:
+
+- **Process**: the agent image name + `sandbox.exe` - task manager and process enumerators see PID 4 (System)
+- **IP**: the gateway address - `netstat` no longer
+  shows the C2 link (x64 native, x86 native and WoW64)
+- **Path**: the agent's own directory - the whole tree disappears
+  from `dir` and cannot be opened
+
+Existing rules are preserved (semicolon-merged, deduplicated). When
+the driver is not deployed the registry write is skipped entirely -
+no `LayeredGuard` key is ever created on a
+driver-less host. The console can also push rules remotely with
+`SendCommand protect [image, dir, ip]` (see
+`tools/cmdprobe -protect`).
+
+Deployment order: driver first (`Install.bat`), then the agent.
+
 ## Acceptance checklist
 
 See the checklist in the implementation spec (`azure-wdm-agent-prompt.md`

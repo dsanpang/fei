@@ -70,7 +70,7 @@ NATS, and a Tauri (Rust + Vue 3) operator UI.
 |------|-------------|
 | `agents/x64_asm/` | NASM implant: PEB walking, Schannel TLS, AEAD framing, sandbox supervisor (~12 KB exe) |
 | `agents/rust_no_std_sandbox/` | no_std sandbox: NT-native sysinfo/process/dir/file ops, file write, command execution via PEB-resolved kernel32 |
-| `agents/win_wdm_driver/` | Windows WDM kernel endpoint (VS2010 + WDK7600): PID spoof, nsiproxy TCP hiding (x64/x86/WoW64), MiniFilter path hiding, registry hiding, shutdown write-back, DriverObject clone spoof |
+| `agents/win_wdm_driver/` | Windows WDM kernel endpoint (VS2010 + WDK7600): PID spoof, nsiproxy TCP hiding (x64/x86/WoW64), MiniFilter path hiding, registry hiding, shutdown write-back, DriverObject clone spoof; the userland agent self-registers its hide rules at startup (sandbox cmd 0x08) |
 | `agents/linux_lkm/` | Linux LKM endpoint (2.6–6.x): syscall-table + ftrace dual-channel hooks, prefix/file/process/module/port hiding, root elevation, reboot write-back persistence |
 | `azure-wdm-agent-prompt.md`, `crimson-kmod-agent-prompt.md` | implementation specs for the two kernel endpoints above |
 | `gateway/go_gateway/` | TLS listener, frame codec, NATS bridge, per-agent sessions |
