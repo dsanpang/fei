@@ -5,8 +5,8 @@ import socket
 import threading
 import time
 
-LISTEN = ("127.0.0.1", 4434)
-TARGET = ("127.0.0.1", 4433)
+LISTEN = ("127.0.0.1", 4436)
+TARGET = ("127.0.0.1", 4435)
 c2s = open(r"C:\fei_probe\cap_c2s.bin", "wb")
 s2c = open(r"C:\fei_probe\cap_s2c.bin", "wb")
 lock = threading.Lock()

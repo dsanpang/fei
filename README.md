@@ -194,15 +194,25 @@ This is an early open-source release; the following are open:
    single-frame: files larger than ~8 KB return a clean `sbx-resp-too-big`
    error (the agent drains the pipe and stays healthy; chunked download is
    roadmap).
-6. **TLS-mode implant is functional via the connection supervisor**: the
-   Schannel receive stream-state still degrades after a few frames, but the
-   supervisor tears down and reconnects (~9 s cycle), and commands complete
-   over TLS (sysinfo/shell verified). PLAIN_TCP + inner AEAD remains the
-   default; sustained TLS operation produces periodic re-registrations in
-   gateway logs (operationally visible).
-7. Console: no topology graph, multi-user collaboration or plugin packaging
-   yet; file upload/download UI still unusable (the gRPC paths underneath
-   are verified working — see `tools/cmdprobe`).
+6. **TLS-mode implant — RESOLVED.** The Schannel stream bug is fixed at
+   the root: the handshake fed every received byte to
+   InitializeSecurityContext through a single-buffer descriptor that can
+   never report SECBUFFER_EXTRA, so after handshake the unconsumed tail
+   (session tickets, early records) was decrypted as application data and
+   Schannel latched SEC_E_MESSAGE_ALTERED - every send then failed and
+   the supervisor reconnected in ~3-9 s cycles. Now the handshake uses
+   the canonical 4-buffer input descriptor and salvages the extra bytes
+   into the receive stream; DecryptMessage results are scanned by buffer
+   type with empty records (tickets) consumed in a loop. Verified on one
+   stable TLS connection (TLS 1.2 and 1.3): sustained heartbeats, the
+   full command battery and a 100 KB chunked download with identical
+   md5. Field diagnostics kept: SSPI failure codes ride exception frames
+   (SSPI-X<code>) and .data counters (dec ok/empty/fail, enc fail, last
+   rc) are readable from live process memory.
+7. Console: the file transfer UI is repaired (proper transfer panel with
+   explicit local/remote paths, status and error surfacing; the old
+   prompt() calls never worked in the Tauri webview). Still missing:
+   topology graph, multi-user collaboration, plugin packaging.
 
 Verified end-to-end (PLAIN_TCP mode, this repository's test tooling):
 crypto interop suite (6/6), sandbox direct suite (7/7), gateway unit/e2e
