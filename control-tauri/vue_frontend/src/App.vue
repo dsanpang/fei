@@ -134,8 +134,26 @@
                   placeholder="输入路径..."
                 />
                 <button @click="loadDirectory">浏览</button>
-                <button @click="uploadFile">上传文件</button>
-                <button @click="downloadFile">下载文件</button>
+              </div>
+              <div v-if="selectedFile" class="transfer-hint">
+                已选中: {{ selectedFile.name }}
+              </div>
+              <div class="transfer-panel">
+                <h4>上传(本地 → 目标机)</h4>
+                <div class="transfer-row">
+                  <input v-model="uploadLocalPath" placeholder="本地文件路径, 如 C:\tools\implant.exe" @change="syncUploadRemote" />
+                  <input v-model="uploadRemotePath" :placeholder="'目标路径, 如 ' + (currentPath || 'C:/') + '/name'" />
+                  <button @click="uploadFile" :disabled="transferring">上传</button>
+                </div>
+                <h4>下载(目标机 → 本地)</h4>
+                <div class="transfer-row">
+                  <input :value="downloadRemotePath" readonly />
+                  <input v-model="downloadLocalPath" placeholder="本地保存路径, 如 C:\users\public\dump.bin" />
+                  <button @click="downloadFile" :disabled="transferring || !selectedFile">下载</button>
+                </div>
+                <div v-if="transferStatus" class="transfer-status" :class="{ 'is-error': transferIsError }">
+                  {{ transferStatus }}
+                </div>
               </div>
               <div class="file-list" v-if="fileList.length > 0">
                 <div 
@@ -219,7 +237,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { computed, ref, onMounted } from 'vue';
 import { invoke } from '@tauri-apps/api/tauri';
 
 interface AgentInfo {
@@ -276,9 +294,35 @@ const tabs = [
   { key: 'plugins', label: '插件管理' }
 ];
 
-const currentPath = ref<string>('/home');
+const currentPath = ref<string>('C:/');
 const fileList = ref<FileEntry[]>([]);
 const selectedFile = ref<FileEntry | null>(null);
+const uploadLocalPath = ref('');
+const uploadRemotePath = ref('');
+const downloadLocalPath = ref('');
+const transferStatus = ref('');
+const transferIsError = ref(false);
+const transferring = ref(false);
+
+function basename(p: string): string {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+function joinRemote(dir: string, name: string): string {
+  const base = dir && dir !== '/' ? dir.replace(/[\\/]+$/, '') : '';
+  return base ? base + '/' + name : name;
+}
+
+const downloadRemotePath = computed(() =>
+  selectedFile.value ? joinRemote(currentPath.value, selectedFile.value.name) : ''
+);
+
+function syncUploadRemote() {
+  if (uploadLocalPath.value && !uploadRemotePath.value) {
+    uploadRemotePath.value = joinRemote(currentPath.value, basename(uploadLocalPath.value));
+  }
+}
 
 const cpuUsage = ref<number>(0);
 const memoryUsage = ref<number>(0);
@@ -434,33 +478,56 @@ function formatFileSize(bytes: number): string {
 // 上传文件
 async function uploadFile() {
   if (!selectedAgent.value) return;
-  
+  if (!uploadLocalPath.value || !uploadRemotePath.value) {
+    transferStatus.value = '上传需要本地路径和目标路径';
+    transferIsError.value = true;
+    return;
+  }
+
+  transferring.value = true;
+  transferStatus.value = '上传中...';
+  transferIsError.value = false;
   try {
-    const result = await invoke('upload_file', { 
+    const result = await invoke('upload_file', {
       agentId: selectedAgent.value.id,
-      localPath: prompt('本地文件路径:') || '', // 本地文件路径
-      remotePath: currentPath.value 
+      localPath: uploadLocalPath.value,
+      remotePath: uploadRemotePath.value
     });
-    console.log('文件上传结果:', result);
+    transferStatus.value = '上传完成: ' + result;
     loadDirectory(); // 重新加载目录
   } catch (error) {
-    console.error('上传文件失败:', error);
+    transferStatus.value = '上传失败: ' + error;
+    transferIsError.value = true;
+  } finally {
+    transferring.value = false;
   }
 }
 
 // 下载文件
 async function downloadFile() {
   if (!selectedAgent.value || !selectedFile.value) return;
-  
+  if (!downloadLocalPath.value) {
+    transferStatus.value = '下载需要本地保存路径';
+    transferIsError.value = true;
+    return;
+  }
+
+  transferring.value = true;
+  transferStatus.value = '下载中...';
+  transferIsError.value = false;
   try {
     const result = await invoke('download_file', { 
       agentId: selectedAgent.value.id,
-      remotePath: `${currentPath.value}/${selectedFile.value.name}`,
-      localPath: prompt('本地文件路径:') || '' // 本地保存路径
+      remotePath: joinRemote(currentPath.value, selectedFile.value.name),
+      localPath: downloadLocalPath.value
     });
-    console.log('文件下载结果:', result);
+    transferStatus.value = '下载完成: ' + result;
+    transferIsError.value = false;
   } catch (error) {
-    console.error('下载文件失败:', error);
+    transferStatus.value = '下载失败: ' + error;
+    transferIsError.value = true;
+  } finally {
+    transferring.value = false;
   }
 }
 
@@ -769,6 +836,37 @@ body {
   cursor: pointer;
 }
 
+.transfer-panel {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid #3a3f4b;
+  border-radius: 6px;
+  background: #23263a;
+}
+.transfer-row {
+  display: flex;
+  gap: 8px;
+  margin: 6px 0 12px 0;
+}
+.transfer-row input {
+  flex: 1;
+}
+.transfer-hint {
+  margin-top: 6px;
+  color: #8ab4f8;
+}
+.transfer-status {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: #2d3a2d;
+  color: #9fd99f;
+  word-break: break-all;
+}
+.transfer-status.is-error {
+  background: #3a2d2d;
+  color: #e0a0a0;
+}
 .file-list {
   max-height: 400px;
   overflow-y: auto;

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -71,6 +72,19 @@ func seal(header, plaintext []byte) []byte {
 	return aead.Seal(nil, nonce, plaintext, header)
 }
 
+func deriveVector() []byte {
+	nonce := make([]byte, 12)
+	putU32LE(nonce[0:4], 0x50534B31)
+	copy(nonce[4:], testAgent[:])
+	c, err := chacha20.NewUnauthenticatedCipher(testKey, nonce)
+	if err != nil {
+		panic(err)
+	}
+	k := make([]byte, 32)
+	c.XORKeyStream(k, k)
+	return k
+}
+
 func main() {
 	outPath := "open_vectors.inc"
 	if len(os.Args) > 1 {
@@ -84,6 +98,8 @@ func main() {
 	h2 := buildHeader(0x0004, 0xA1B2C3D4, uint32(len(pt2)))
 	seal2 := seal(h2, pt2)
 	fmt.Printf("SEAL2: %s\n", hex.EncodeToString(append(append([]byte{}, h2...), seal2...)))
+	dk := deriveVector()
+	fmt.Printf("DERIVE: %s\n", hex.EncodeToString(dk))
 
 	// decrypt-direction vectors (type 0x0002 plugin_load)
 	ov1 := seal(buildHeader(0x0002, 0x11223344, uint32(len(pt1))), pt1)
@@ -100,6 +116,8 @@ func main() {
 	writeDB(f, ov1)
 	fmt.Fprintln(f, "open_vec2:")
 	writeDB(f, ov2)
+	fmt.Fprintln(f, "derive_vec:")
+	writeDB(f, dk)
 }
 
 func writeDB(f *os.File, b []byte) {

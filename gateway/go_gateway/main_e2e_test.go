@@ -76,6 +76,11 @@ func loadTestTLSConfig(t *testing.T) (*tls.Config, *tls.Config) {
 // 完整 E2E 测试: 加密帧 → mTLS 通道 → 解密 → 会话管理 → NATS 订阅检查
 func TestFullE2E_mTLS_WithEncryption(t *testing.T) {
 	psk := loadTestPSK(t)
+	agentID := [8]byte{0xFE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77}
+	agentKey, keyErr := protocol.DeriveAgentPSK(psk, agentID)
+	if keyErr != nil {
+		t.Fatalf("derive: %v", keyErr)
+	}
 	serverCfg, clientCfg := loadTestTLSConfig(t)
 
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", serverCfg)
@@ -116,7 +121,7 @@ func TestFullE2E_mTLS_WithEncryption(t *testing.T) {
 		}
 
 		for i := 0; i < 3; i++ {
-			frame, err := protocol.ReadEncryptedFrame(conn, psk)
+			frame, err := protocol.ReadEncryptedFrame(conn, agentKey)
 			if err != nil {
 				t.Errorf("read frame %d: %v", i, err)
 				return
@@ -131,10 +136,8 @@ func TestFullE2E_mTLS_WithEncryption(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	agentID := [8]byte{0xFE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77}
-
 	// 发送心跳
-	err = protocol.WriteEncryptedFrame(clientConn, psk, protocol.TypeHeartbeat, 1, agentID, nil)
+	err = protocol.WriteEncryptedFrame(clientConn, agentKey, protocol.TypeHeartbeat, 1, agentID, nil)
 	if err != nil {
 		t.Fatalf("send heartbeat: %v", err)
 	}
@@ -142,13 +145,13 @@ func TestFullE2E_mTLS_WithEncryption(t *testing.T) {
 	// 发送执行结果
 	result := map[string]string{"cmd": "whoami", "output": "SYSTEM"}
 	resultBytes, _ := json.Marshal(result)
-	err = protocol.WriteEncryptedFrame(clientConn, psk, protocol.TypeExecReturn, 2, agentID, resultBytes)
+	err = protocol.WriteEncryptedFrame(clientConn, agentKey, protocol.TypeExecReturn, 2, agentID, resultBytes)
 	if err != nil {
 		t.Fatalf("send exec return: %v", err)
 	}
 
 	// 发送插件载入确认
-	err = protocol.WriteEncryptedFrame(clientConn, psk, protocol.TypePluginLoad, 3, agentID, []byte("plugin loaded"))
+	err = protocol.WriteEncryptedFrame(clientConn, agentKey, protocol.TypePluginLoad, 3, agentID, []byte("plugin loaded"))
 	if err != nil {
 		t.Fatalf("send plugin load: %v", err)
 	}
@@ -187,6 +190,10 @@ func TestGatewayToClient_CommandDelivery(t *testing.T) {
 	addr := ln.Addr().String()
 
 	agentID := [8]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11}
+	agentKey, keyErr := protocol.DeriveAgentPSK(psk, agentID)
+	if keyErr != nil {
+		t.Fatalf("derive: %v", keyErr)
+	}
 	recvFrames := make(chan *protocol.Frame, 5)
 
 	go func() {
@@ -198,7 +205,7 @@ func TestGatewayToClient_CommandDelivery(t *testing.T) {
 		defer conn.Close()
 
 		for i := 0; i < 2; i++ {
-			frame, err := protocol.ReadEncryptedFrame(conn, psk)
+			frame, err := protocol.ReadEncryptedFrame(conn, agentKey)
 			if err != nil {
 				if err == io.EOF {
 					return
@@ -219,14 +226,14 @@ func TestGatewayToClient_CommandDelivery(t *testing.T) {
 	// 模拟下发两条命令
 	cmd1 := map[string]interface{}{"action": "shell_exec", "cmd": "whoami"}
 	cmd1Bytes, _ := json.Marshal(cmd1)
-	err = protocol.WriteEncryptedFrame(serverConn, psk, protocol.TypeExecReturn, 100, agentID, cmd1Bytes)
+	err = protocol.WriteEncryptedFrame(serverConn, agentKey, protocol.TypeExecReturn, 100, agentID, cmd1Bytes)
 	if err != nil {
 		t.Fatalf("write cmd1: %v", err)
 	}
 
 	cmd2 := map[string]interface{}{"action": "plugin_install", "name": "sys_info"}
 	cmd2Bytes, _ := json.Marshal(cmd2)
-	err = protocol.WriteEncryptedFrame(serverConn, psk, protocol.TypePluginLoad, 101, agentID, cmd2Bytes)
+	err = protocol.WriteEncryptedFrame(serverConn, agentKey, protocol.TypePluginLoad, 101, agentID, cmd2Bytes)
 	if err != nil {
 		t.Fatalf("write cmd2: %v", err)
 	}
@@ -263,10 +270,14 @@ func TestConcurrentConnections(t *testing.T) {
 		go func(clientIdx int) {
 			defer wg.Done()
 			agentID := [8]byte{byte(clientIdx)}
+			agentKey, keyErr := protocol.DeriveAgentPSK(psk, agentID)
+			if keyErr != nil {
+				t.Fatalf("derive: %v", keyErr)
+			}
 			for i := 0; i < framesPerClient; i++ {
 				var buf bytes.Buffer
 				payload := []byte(`{"idx":` + string(rune('0'+clientIdx)) + `}`)
-				err := protocol.WriteEncryptedFrame(&buf, psk, protocol.TypeExecReturn, uint32(i), agentID, payload)
+				err := protocol.WriteEncryptedFrame(&buf, agentKey, protocol.TypeExecReturn, uint32(i), agentID, payload)
 				if err != nil {
 					errCh <- err
 					return

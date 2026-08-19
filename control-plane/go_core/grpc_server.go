@@ -437,57 +437,76 @@ func (s *GRPCServer) UploadFile(ctx context.Context, req *pb.UploadFileRequest) 
 	}, nil
 }
 
-// DownloadFile: sends a sandbox file_read frame and returns the content hex.
+// DownloadFile: chunked ranged file_read (path\x00offset\x00len frames,
+// 4000 bytes per chunk) reassembled into one buffer - the agent's 16KB
+// response budget no longer caps downloads at ~8KB.
 func (s *GRPCServer) DownloadFile(ctx context.Context, req *pb.DownloadFileRequest) (*pb.DownloadFileResponse, error) {
-	payload := sandboxFrame(0x04, []byte(req.RemotePath))
+	const chunk = 4000
+	var content []byte
+	var fileSize int64
 
-	taskID, err := s.forwardCommandToAgent(req.AgentId, 0x02, payload)
-	if err != nil {
-		return &pb.DownloadFileResponse{Success: false, Error: err.Error()}, nil
-	}
+	for off := int64(0); ; off += chunk {
+		frame := fmt.Sprintf("%s\x00%d\x00%d", req.RemotePath, off, chunk)
+		payload := sandboxFrame(0x04, []byte(frame))
 
-	task := s.waitTask(taskID, 8*time.Second)
-	if task == nil {
-		return &pb.DownloadFileResponse{
-			Success: false,
-			Error:   fmt.Sprintf("timeout waiting for agent (task %s)", taskID),
-		}, nil
-	}
-	if task.Status != TaskCompleted {
-		return &pb.DownloadFileResponse{
-			Success: false,
-			Error:   fmt.Sprintf("task %s: %s", taskID, task.Status),
-		}, nil
-	}
+		taskID, err := s.forwardCommandToAgent(req.AgentId, 0x02, payload)
+		if err != nil {
+			return &pb.DownloadFileResponse{Success: false, Error: err.Error()}, nil
+		}
 
-	var parsed struct {
-		ContentHex string `json:"content_hex"`
-		Error      string `json:"error"`
-	}
-	if err := json.Unmarshal(decodeTaskResult(task.Result), &parsed); err != nil {
-		return &pb.DownloadFileResponse{Success: false, Error: err.Error()}, nil
-	}
-	if parsed.Error != "" {
-		return &pb.DownloadFileResponse{Success: false, Error: parsed.Error}, nil
+		task := s.waitTask(taskID, 8*time.Second)
+		if task == nil {
+			return &pb.DownloadFileResponse{
+				Success: false,
+				Error:   fmt.Sprintf("timeout waiting for agent (task %s)", taskID),
+			}, nil
+		}
+		if task.Status != TaskCompleted {
+			return &pb.DownloadFileResponse{
+				Success: false,
+				Error:   fmt.Sprintf("task %s: %s", taskID, task.Status),
+			}, nil
+		}
+
+		var parsed struct {
+			FileSize   int64  `json:"file_size"`
+			ContentHex string `json:"content_hex"`
+			Error      string `json:"error"`
+		}
+		if err := json.Unmarshal(decodeTaskResult(task.Result), &parsed); err != nil {
+			return &pb.DownloadFileResponse{Success: false, Error: err.Error()}, nil
+		}
+		if parsed.Error != "" {
+			return &pb.DownloadFileResponse{Success: false, Error: parsed.Error}, nil
+		}
+		if off == 0 {
+			fileSize = parsed.FileSize
+		}
+
+		raw, err := hex.DecodeString(parsed.ContentHex)
+		if err != nil {
+			return &pb.DownloadFileResponse{Success: false, Error: err.Error()}, nil
+		}
+		content = append(content, raw...)
+
+		if int64(len(raw)) < chunk || (fileSize > 0 && int64(len(content)) >= fileSize) {
+			break
+		}
 	}
 
 	if req.LocalPath != "" {
-		raw, err := hex.DecodeString(parsed.ContentHex)
-		if err == nil {
-			err = os.WriteFile(req.LocalPath, raw, 0644)
-		}
-		if err != nil {
+		if err := os.WriteFile(req.LocalPath, content, 0644); err != nil {
 			return &pb.DownloadFileResponse{Success: false, Error: err.Error()}, nil
 		}
 		return &pb.DownloadFileResponse{
 			Success: true,
-			Message: fmt.Sprintf("saved %s (%d bytes)", req.LocalPath, len(raw)),
+			Message: fmt.Sprintf("saved %s (%d bytes)", req.LocalPath, len(content)),
 		}, nil
 	}
 
 	return &pb.DownloadFileResponse{
 		Success: true,
-		Message: parsed.ContentHex,
+		Message: hex.EncodeToString(content),
 	}, nil
 }
 

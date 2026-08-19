@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"golang.org/x/crypto/chacha20"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -268,6 +269,71 @@ func WriteEncryptedFrame(w io.Writer, psk []byte, msgType uint16, seq uint32, ag
 		}
 	}
 	return nil
+}
+
+// DeriveAgentPSK derives the per-agent session key from the master PSK:
+// the first 32 bytes of the ChaCha20 keystream (counter 0) under the
+// domain-separated nonce le32(0x50534B31) || agent_id. The NASM implant
+// derives the identical value at startup (derive_agent_psk), so the
+// master key never encrypts traffic and one captured agent binary
+// compromises only its own stream.
+func DeriveAgentPSK(master []byte, agentID [8]byte) ([]byte, error) {
+	nonce := make([]byte, chacha20poly1305.NonceSize)
+	binary.LittleEndian.PutUint32(nonce[0:4], 0x50534B31)
+	copy(nonce[4:], agentID[:])
+
+	cipher, err := chacha20.NewUnauthenticatedCipher(master, nonce)
+	if err != nil {
+		return nil, fmt.Errorf("fei: init chacha20 for derivation: %w", err)
+	}
+	key := make([]byte, 32)
+	cipher.XORKeyStream(key, key) // keystream block 0, first 32 bytes
+	return key, nil
+}
+
+// ReadEncryptedFrameAgent reads the first frame of a connection and
+// derives the per-agent session key from the (plaintext) header agent id
+// before decrypting. Returns the frame and the derived key.
+func ReadEncryptedFrameAgent(r io.Reader, master []byte) (*Frame, []byte, error) {
+	headerBuf := make([]byte, HeaderSize)
+	if _, err := io.ReadFull(r, headerBuf); err != nil {
+		return nil, nil, fmt.Errorf("fei: read header: %w", err)
+	}
+
+	hdr, err := DecodeHeader(headerBuf)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ValidateHeader(hdr); err != nil {
+		return nil, nil, err
+	}
+
+	agentPSK, err := DeriveAgentPSK(master, hdr.AgentID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if hdr.Type == TypeHeartbeat && hdr.Length == 0 && hdr.PaddingLen == 0 {
+		return &Frame{Header: *hdr, Payload: nil}, agentPSK, nil
+	}
+
+	ciphertextSize := int(hdr.Length) + chacha20poly1305.Overhead
+	totalBodySize := ciphertextSize + int(hdr.PaddingLen)
+	if totalBodySize > MaxPayloadSize+chacha20poly1305.Overhead+MaxPaddingSize {
+		return nil, nil, ErrPayloadTooBig
+	}
+
+	body := make([]byte, totalBodySize)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, nil, fmt.Errorf("fei: read encrypted body: %w", err)
+	}
+
+	plaintext, err := Decrypt(agentPSK, hdr, body[:ciphertextSize])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &Frame{Header: *hdr, Payload: plaintext}, agentPSK, nil
 }
 
 func DeriveNonce(seq uint32, agentID [8]byte) []byte {

@@ -27,6 +27,7 @@ str_seal2: db "SEAL2: "
 str_open:  db "OPEN1: "
 str_open2: db "OPEN2: "
 str_bad:   db "OPENBAD: "
+str_derive: db "DERIVE1: "
 str_ok:    db "OK"
 str_reject: db "REJECT"
 newline:   db 13, 10
@@ -252,7 +253,7 @@ _start:
     mov edx, 6
     call write_str
     call write_nl
-    jmp .exit
+    jmp .dv_run
 .badfail_ok:
     lea rcx, [str_bad]
     mov edx, 8
@@ -260,6 +261,38 @@ _start:
     lea rcx, [str_ok]
     mov edx, 2
     call write_str
+    call write_nl
+
+    ; ---- DERIVE1: per-agent PSK derivation matches the Go vector ----
+    ; (last test: derive_agent_psk overwrites psk in place)
+.dv_run:
+    call derive_agent_psk
+    lea rsi, [psk]
+    lea rdi, [derive_vec]
+    mov ecx, 32
+.dv_cmp:
+    mov al, [rsi]
+    cmp al, [rdi]
+    jne .dv_fail
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .dv_cmp
+    lea rcx, [str_derive]
+    mov edx, 8
+    call write_str
+    lea rcx, [str_ok]
+    mov edx, 2
+    call write_str
+    call write_nl
+    jmp .exit
+.dv_fail:
+    lea rcx, [str_derive]
+    mov edx, 8
+    call write_str
+    lea rcx, [psk]
+    mov edx, 32
+    call write_hex
     call write_nl
 
 .exit:

@@ -21,6 +21,7 @@ import (
 type AgentSession struct {
 	AgentID       [8]byte
 	Conn          net.Conn
+	PSK           []byte // per-agent key derived from the master PSK
 	LastSeen      time.Time
 	SeqIn         uint32
 	RxSeq         uint32 // highest sequence accepted from the agent
@@ -191,7 +192,7 @@ func (gw *Gateway) handleConn(conn net.Conn) {
 
 	hostname, ipAddress := extractTLSMetadata(conn)
 
-	frame, err := protocol.ReadEncryptedFrame(conn, gw.psk)
+	frame, agentPSK, err := protocol.ReadEncryptedFrameAgent(conn, gw.psk)
 	if err != nil {
 		if err.Error() != "fei: read header: EOF" {
 			log.Printf("[%s] first frame error: %v", addr, err)
@@ -203,6 +204,7 @@ func (gw *Gateway) handleConn(conn net.Conn) {
 	session := &AgentSession{
 		AgentID:      frame.Header.AgentID,
 		Conn:         conn,
+		PSK:          agentPSK,
 		LastSeen:     time.Now(),
 		SeqIn:        frame.Header.Seq,
 		Hostname:     hostname,
@@ -233,7 +235,7 @@ func (gw *Gateway) handleConn(conn net.Conn) {
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		frame, err := protocol.ReadEncryptedFrame(conn, gw.psk)
+		frame, err := protocol.ReadEncryptedFrame(conn, session.PSK)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				log.Printf("[%s] read timeout, closing", agentIDHex)
@@ -277,7 +279,7 @@ func (gw *Gateway) processFrame(session *AgentSession, frame *protocol.Frame, ag
 		session.mu.Lock()
 		session.TxSeq++
 		ackSeq := session.TxSeq
-		err := protocol.WriteEncryptedFrame(session.Conn, gw.psk, protocol.TypeHeartbeat, ackSeq, session.AgentID, []byte("ack"))
+		err := protocol.WriteEncryptedFrame(session.Conn, session.PSK, protocol.TypeHeartbeat, ackSeq, session.AgentID, []byte("ack"))
 		session.mu.Unlock()
 		if err != nil {
 			log.Printf("[%s] heartbeat ACK write failed: %v", agentIDHex, err)
@@ -351,7 +353,7 @@ func (gw *Gateway) handleCommandFromControlPlane(session *AgentSession, data []b
 	}
 
 	log.Printf("[%s] delivering command type=0x%04x seq=%d payload=%d bytes", hex.EncodeToString(session.AgentID[:]), cmd.Type, seq, len(cmd.Payload))
-	err := protocol.WriteEncryptedFrame(session.Conn, gw.psk, cmd.Type, seq, session.AgentID, cmd.Payload)
+	err := protocol.WriteEncryptedFrame(session.Conn, session.PSK, cmd.Type, seq, session.AgentID, cmd.Payload)
 	if err != nil {
 		agentIDHex := hex.EncodeToString(session.AgentID[:])
 		log.Printf("[%s] write command failed: %v", agentIDHex, err)

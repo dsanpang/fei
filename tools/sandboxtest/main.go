@@ -101,8 +101,26 @@ func main() {
 		if err != nil {
 			return err
 		}
-		if want := `"content_hex":"48656c6c6f20466569"`; string(r) != "{"+want+"}" {
+		if want := `"content_hex":"48656c6c6f20466569"`; !strings.Contains(string(r), want) {
 			return fmt.Errorf("roundtrip mismatch: %s", r)
+		}
+		return nil
+	})
+	check("file_read_range", func() error {
+		// "Hello Fei": offset 6 length 3 = "Fei"
+		payload := append([]byte(`C:\Windows\Temp\fei_sbtest.txt`), 0)
+		payload = append(payload, []byte("6")...)
+		payload = append(payload, 0)
+		payload = append(payload, []byte("3")...)
+		r, err := roundtrip(stdin, stdout, 0x04, payload)
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(string(r), `"content_hex":"466569"`) {
+			return fmt.Errorf("range mismatch: %s", r)
+		}
+		if !strings.Contains(string(r), `"file_size":9`) {
+			return fmt.Errorf("size missing: %s", r)
 		}
 		return nil
 	})
@@ -112,6 +130,26 @@ func main() {
 			return err
 		}
 		return expectJSON(r, "exit_code")
+	})
+	check("persist", func() error {
+		// autostart value into a TEST key (custom path => create allowed)
+		const ptestPath = `\Registry\Machine\SOFTWARE\FeiPersistTest`
+		payload := []byte("FileSyncSvc\x00C:\\fei\\agent.exe\x00" + ptestPath)
+		r, err := roundtrip(stdin, stdout, 0x0A, payload)
+		if err != nil {
+			return err
+		}
+		if err := expectJSON(r, "persist"); err != nil {
+			return err
+		}
+		got, err := regReadString(`SOFTWARE\FeiPersistTest`, "FileSyncSvc")
+		if err != nil {
+			return err
+		}
+		if strings.TrimRight(got, "\x00") != `C:\fei\agent.exe` {
+			return fmt.Errorf("persist value = %q", got)
+		}
+		return nil
 	})
 	check("protect", func() error {
 		// merge rules into a TEST key (custom path => create allowed);
